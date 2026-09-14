@@ -1,6 +1,8 @@
 # FreekiCAD
 <img src="Resources/icons/FreekiCAD.png" alt="Logo" width="64" height="64">
 
+Release mirror for https://github.com/buganini/Kikakuka/tree/main/FreekiCAD
+
 FreekiCAD bridges KiCad and FreeCAD. It supports:
 
 - Importing KiCad PCB files
