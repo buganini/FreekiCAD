@@ -1,4 +1,4 @@
-"""Build zero-thickness solder-mask display geometry from KiCad data."""
+"""Build planar solder-mask geometry at the finished outer surfaces."""
 
 from dataclasses import dataclass
 
@@ -27,6 +27,7 @@ class MaskLayerInfo:
     thickness: float
     color: tuple
     transparency: int
+    direction: float
 
 
 def _color_rgba(color, fallback=None):
@@ -93,13 +94,11 @@ def substrate_color(stackup):
     return substrate_appearance(stackup)[0]
 
 
-def mask_stackup_layers(stackup, board_layer, total_thickness=None,
-                        outer_inset=0.0):
+def mask_stackup_layers(stackup, board_layer, total_thickness=None):
     total_mm = (float(total_thickness)
                 if total_thickness is not None
                 else sum(max(0, getattr(entry, "thickness", 0))
                          for entry in stackup.layers) / NM_PER_MM)
-    inset = max(0.0, float(outer_inset))
     result = []
     for entry in stackup.layers:
         try:
@@ -117,10 +116,11 @@ def mask_stackup_layers(stackup, board_layer, total_thickness=None,
         result.append(MaskLayerInfo(
             layer=entry.layer,
             name="F.Mask" if is_front else "B.Mask",
-            z=(total_mm - inset if is_front else inset),
+            z=(total_mm - thickness if is_front else thickness),
             thickness=thickness,
             color=rgba[:3],
             transparency=_transparency(rgba[3]),
+            direction=thickness if is_front else -thickness,
         ))
     return result
 
@@ -155,13 +155,8 @@ def padstack_item_exists_on_layer(item, layer):
         return False
 
 
-def build_solder_mask_layers(board, stackup, board_layer, board_face,
-                             board_shapes=None, warn=None,
-                             total_thickness=None, outer_inset=0.0):
-    """Return F.Mask/B.Mask faces using KiCad-computed padstack openings."""
-    infos = mask_stackup_layers(
-        stackup, board_layer, total_thickness=total_thickness,
-        outer_inset=outer_inset)
+def collect_solder_mask_openings(board, layers, board_shapes=None, warn=None):
+    """Build reusable pad/via/graphic opening faces for mask layers."""
     try:
         pads = list(board.get_pads())
     except Exception as ex:
@@ -174,16 +169,17 @@ def build_solder_mask_layers(board, stackup, board_layer, board_face,
         vias = []
         if warn:
             warn(f"Could not read vias for solder mask: {ex}")
-    result = []
-    for info in infos:
+
+    result = {}
+    for layer in layers:
         layer_pads = [pad for pad in pads
-                      if padstack_item_exists_on_layer(pad, info.layer)]
+                      if padstack_item_exists_on_layer(pad, layer)]
         layer_vias = [via for via in vias
-                      if padstack_item_exists_on_layer(via, info.layer)]
+                      if padstack_item_exists_on_layer(via, layer)]
         polygons = read_mask_opening_polygons(
-            board, layer_pads, info.layer, warn)
+            board, layer_pads, layer, warn)
         polygons.extend(read_mask_opening_polygons(
-            board, layer_vias, info.layer, warn))
+            board, layer_vias, layer, warn))
         openings = []
         for polygon in polygons:
             try:
@@ -194,7 +190,7 @@ def build_solder_mask_layers(board, stackup, board_layer, board_face,
                 if warn:
                     warn(f"Could not build mask opening: {ex}")
         for graphic in board_shapes or []:
-            if getattr(graphic, "layer", None) != info.layer:
+            if getattr(graphic, "layer", None) != layer:
                 continue
             try:
                 face = board_graphic_shape(graphic)
@@ -203,27 +199,57 @@ def build_solder_mask_layers(board, stackup, board_layer, board_face,
             except Exception as ex:
                 if warn:
                     warn(f"Could not build mask graphic opening: {ex}")
+        result[layer] = {
+            "shapes": openings,
+            "pad_count": len(layer_pads),
+            "via_count": len(layer_vias),
+        }
+    return result
 
-        mask = board_face.copy()
+
+def build_solder_mask_layers(board, stackup, board_layer, board_face,
+                             board_shapes=None, warn=None,
+                             total_thickness=None,
+                             opening_data=None):
+    """Return planar F.Mask/B.Mask display profiles."""
+    infos = mask_stackup_layers(
+        stackup, board_layer, total_thickness=total_thickness)
+    if opening_data is None:
+        opening_data = collect_solder_mask_openings(
+            board, [info.layer for info in infos],
+            board_shapes=board_shapes, warn=warn)
+    result = []
+    for info in infos:
+        layer_openings = opening_data.get(info.layer, {})
+        openings = list(layer_openings.get("shapes", []))
+
+        profile = board_face.copy()
         if openings:
             try:
-                mask = mask.cut(Part.makeCompound(openings))
+                profile = profile.cut(Part.makeCompound(openings))
             except Exception as ex:
                 if warn:
                     warn(f"Could not subtract {info.name} openings: {ex}")
-        mask.translate(FreeCAD.Vector(0, 0, info.z))
+        display_z = info.z + info.direction
+        profile.translate(FreeCAD.Vector(0, 0, display_z))
+        mask = profile
         result.append({
             "layer": info.layer,
             "name": info.name,
             "z": info.z,
+            "display_z": display_z,
             "thickness": info.thickness,
+            "direction": 0.0,
+            "body_direction": info.direction,
             "color": info.color,
             "transparency": info.transparency,
-            "pad_count": len(layer_pads),
-            "via_count": len(layer_vias),
+            "pad_count": int(layer_openings.get("pad_count", 0)),
+            "via_count": int(layer_openings.get("via_count", 0)),
             "opening_count": len(openings),
             "face_count": len(getattr(mask, "Faces", [])),
             "area": float(getattr(mask, "Area", 0.0)),
+            "volume": 0.0,
             "shape": mask,
+            "profile_shape": profile,
         })
     return result
