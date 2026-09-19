@@ -67,13 +67,15 @@ import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys
 
 Restart FreeCAD after installation.
 
-## Headless Assembly Export
+## Headless STEP Export
 
 Use `kkkk_export.py` with FreeCAD's command-line executable to convert a
-`.kkkk_asm` assembly to STEP without opening the FreeCAD GUI:
+`.kkkk_asm` assembly or a single `.kicad_pcb` board to STEP without opening
+the FreeCAD GUI:
 
 ```text
 freecadcmd scripts/kkkk_export.py input.kkkk_asm output.step
+freecadcmd scripts/kkkk_export.py input.kicad_pcb output.step
 ```
 
 The exporter synchronously loads every object and component model before it
@@ -81,6 +83,7 @@ writes the STEP file. Assemblies containing only STEP objects need no extra
 Python dependencies. For assemblies containing KiCad PCB objects, install
 `kicad-python` and `shapely` and keep the Kikakuka Workspace Manager running;
 it resolves or starts the matching KiCad instance and waits for its IPC API.
+Direct `.kicad_pcb` input has the same requirements.
 
 Run `scripts/kkkk_export.py` from the FreekiCAD directory. The actual FreeCAD
 user-data directory can be printed from FreeCAD's Python console with
@@ -112,6 +115,9 @@ AppImage, use its `--console` mode:
 ```sh
 ./FreeCAD_1.1-Linux-x86_64.AppImage --console scripts/kkkk_export.py input.kkkk_asm output.step
 ```
+
+In the platform-specific commands above, `input.kkkk_asm` may be replaced by
+`input.kicad_pcb`.
 
 ## FreeCAD Assembly Workbench
 
@@ -247,6 +253,10 @@ millimetres.
 | `3M468` | `#F2E3BD` | `0.28` |
 | `tesa8854` | `#EEE8D8` | `0.45` |
 | `3M9077` | `#DDE8EE` | `0.30` |
+
+Other material names are accepted with a warning. When `Color` or `Opacity`
+is omitted for an unlisted material, the corresponding `Polyimide` default is
+used.
 
 Front stiffeners extend outward beyond the front silkscreen plane; back
 stiffeners extend outward beyond the back silkscreen plane. Pad, via, and

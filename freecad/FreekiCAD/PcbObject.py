@@ -18,8 +18,8 @@ from .Units import parse_length_mm
 
 DEFAULT_PCB_THICKNESS = 1.6  # mm fallback
 GEOMETRY_TOLERANCE = 0.001  # mm (1 µm)
+PARTITION_RELATIVE_TOLERANCE = 1e-6
 BEND_ANNOTATION_POSITION_TOLERANCE = 0.1  # mm
-DEBUG_BENDING_BFS = True
 STEP_IMPORTER_REVISION = 1
 COPPER_STRAIN_WARNING = 0.05
 
@@ -181,8 +181,8 @@ def _stiffener_object_name(is_front, name, material, index):
     return prefix + suffix
 
 
-def _log_bending_bfs(message):
-    if DEBUG_BENDING_BFS:
+def _log_bending_bfs(message, enabled):
+    if enabled:
         FreeCAD.Console.PrintMessage(message)
 
 
@@ -489,12 +489,15 @@ def _select_monitored_coupler_poses(monitored, live):
     return selected
 
 
+_COUPLER_POSE_FIELDS = (
+    'ref', 'type', 'x', 'y', 'board_z', 'is_back', 'z', 'offset', 'tilt',
+    'rotation', 'target_x', 'target_y', 'target_z')
+
+
 def _coupler_pose_signature(poses):
     """Return the live fields which affect coupler placement."""
-    fields = (
-        'ref', 'type', 'x', 'y', 'board_z', 'is_back', 'z', 'offset', 'tilt',
-        'rotation', 'target_x', 'target_y', 'target_z')
-    return tuple(tuple(pose.get(field) for field in fields) for pose in poses)
+    return tuple(tuple(pose.get(field) for field in _COUPLER_POSE_FIELDS)
+                 for pose in poses)
 
 
 def _nearest_bend_piece(pieces, point, excluded=None):
@@ -530,6 +533,41 @@ def _nearest_bend_piece(pieces, point, excluded=None):
     if result[0] is None and excluded:
         result = _closest(False)
     return result
+
+
+def _rigid_wedge_destinations(neighbors, source_pi, strip_pieces):
+    """Return only rigid destinations reachable through one wedge.
+
+    A neighboring strip needs its own canonical entry crossing. Treating it
+    as the rigid destination of another wedge lets first-visit BFS assign the
+    wrong parent and can leave its bend chain empty.
+    """
+    return [
+        entry for entry in neighbors
+        if entry[0] != source_pi and entry[0] not in strip_pieces
+    ]
+
+
+def _placement_matrix_signature(placement, digits=10):
+    """Return a tolerance-stable signature for a FreeCAD Placement."""
+    matrix = placement.toMatrix()
+    return tuple(
+        round(float(getattr(matrix, f'A{row}{column}')), digits)
+        for row in range(1, 5)
+        for column in range(1, 5))
+
+
+def _bend_partition_signature(cut_plan, thickness, digits=10):
+    """Identify flat body partitions from their physical cut geometry."""
+    return (
+        round(float(thickness), digits),
+        tuple(
+            (entry[2], int(entry[3]),
+             round(float(entry[0].x), digits),
+             round(float(entry[0].y), digits),
+             round(float(entry[1].x), digits),
+             round(float(entry[1].y), digits))
+            for entry in cut_plan))
 
 
 def _signed_line_side_2d(point, seg_p0, seg_p1):
@@ -701,6 +739,293 @@ def _single_planar_face(shape):
         return faces[0]
     raise ValueError(
         "planar boolean produced {} faces; expected one".format(len(faces)))
+
+
+def _linear_outline_data(face):
+    """Return cached XY boundary segments when every outline edge is linear."""
+    try:
+        wires = list(face.Wires)
+        outer = face.OuterWire
+    except Exception:
+        return None
+    if not wires:
+        return None
+
+    def _wire_segments(wire):
+        result = []
+        endpoint_counts = {}
+        for edge in wire.Edges:
+            curve_name = type(getattr(edge, 'Curve', None)).__name__
+            if curve_name not in ('Line', 'LineSegment'):
+                return None
+            vertices = list(getattr(edge, 'Vertexes', []))
+            if len(vertices) != 2:
+                return None
+            p0 = vertices[0].Point
+            p1 = vertices[1].Point
+            if math.hypot(p1.x - p0.x, p1.y - p0.y) <= 1e-12:
+                continue
+            for point in (p0, p1):
+                key = (round(float(point.x), 9),
+                       round(float(point.y), 9))
+                endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
+            result.append((
+                float(p0.x), float(p0.y),
+                float(p1.x), float(p1.y)))
+        # A simple closed ring visits every geometric vertex exactly once.
+        # Maze-like outlines can legally touch or retrace themselves in OCC;
+        # their common() result may contain overlapping intervals that an
+        # even/odd polygon clip would discard.  Keep those on the exact BRep
+        # fallback instead of changing the cut topology.
+        if any(count != 2 for count in endpoint_counts.values()):
+            return None
+        return result
+
+    all_segments = []
+    for wire in wires:
+        segments = _wire_segments(wire)
+        if segments is None:
+            return None
+        all_segments.extend(segments)
+
+    # A wire may cross itself without exposing an OCC vertex at the crossing.
+    # Reject any boundary contact other than one shared endpoint so the
+    # even/odd clipper is reserved for ordinary simple rings.  The quadratic
+    # check runs once per bend rebuild and remains much cheaper than dozens of
+    # BRep common() operations for the eligible outlines.
+    def _same_point(ax, ay, bx, by):
+        return abs(ax - bx) <= 1e-9 and abs(ay - by) <= 1e-9
+
+    def _orientation(ax, ay, bx, by, cx, cy):
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+    def _on_segment(ax, ay, bx, by, px, py):
+        return (min(ax, bx) - 1e-9 <= px <= max(ax, bx) + 1e-9
+                and min(ay, by) - 1e-9 <= py <= max(ay, by) + 1e-9
+                and abs(_orientation(ax, ay, bx, by, px, py)) <= 1e-9)
+
+    for index, first in enumerate(all_segments):
+        ax, ay, bx, by = first
+        for second in all_segments[index + 1:]:
+            cx, cy, dx, dy = second
+            if (max(ax, bx) < min(cx, dx) - 1e-9
+                    or max(cx, dx) < min(ax, bx) - 1e-9
+                    or max(ay, by) < min(cy, dy) - 1e-9
+                    or max(cy, dy) < min(ay, by) - 1e-9):
+                continue
+            shared_endpoints = sum((
+                _same_point(ax, ay, cx, cy),
+                _same_point(ax, ay, dx, dy),
+                _same_point(bx, by, cx, cy),
+                _same_point(bx, by, dx, dy),
+            ))
+            o1 = _orientation(ax, ay, bx, by, cx, cy)
+            o2 = _orientation(ax, ay, bx, by, dx, dy)
+            o3 = _orientation(cx, cy, dx, dy, ax, ay)
+            o4 = _orientation(cx, cy, dx, dy, bx, by)
+            contacts = (
+                _on_segment(ax, ay, bx, by, cx, cy)
+                or _on_segment(ax, ay, bx, by, dx, dy)
+                or _on_segment(cx, cy, dx, dy, ax, ay)
+                or _on_segment(cx, cy, dx, dy, bx, by)
+                or ((o1 > 1e-9 and o2 < -1e-9
+                     or o1 < -1e-9 and o2 > 1e-9)
+                    and (o3 > 1e-9 and o4 < -1e-9
+                         or o3 < -1e-9 and o4 > 1e-9)))
+            collinear_overlap = False
+            if (abs(o1) <= 1e-9 and abs(o2) <= 1e-9
+                    and abs(o3) <= 1e-9 and abs(o4) <= 1e-9):
+                if abs(bx - ax) >= abs(by - ay):
+                    overlap = (min(max(ax, bx), max(cx, dx))
+                               - max(min(ax, bx), min(cx, dx)))
+                else:
+                    overlap = (min(max(ay, by), max(cy, dy))
+                               - max(min(ay, by), min(cy, dy)))
+                collinear_overlap = overlap > 1e-9
+            if contacts and (shared_endpoints != 1 or collinear_overlap):
+                return None
+    outer_segments = _wire_segments(outer)
+    if not all_segments or not outer_segments:
+        return None
+    return all_segments, outer_segments
+
+
+def _clip_segment_to_linear_outline(p0, p1, outline_data):
+    """Clip a finite XY segment, or return None to request BRep fallback."""
+    all_segments, outer_segments = outline_data
+    rx = float(p1.x - p0.x)
+    ry = float(p1.y - p0.y)
+    rr = rx * rx + ry * ry
+    if rr <= 1e-18:
+        return []
+
+    def _cross(ax, ay, bx, by):
+        return ax * by - ay * bx
+
+    cut_values = [0.0, 1.0]
+    for x0, y0, x1, y1 in all_segments:
+        sx = x1 - x0
+        sy = y1 - y0
+        qx = x0 - p0.x
+        qy = y0 - p0.y
+        denominator = _cross(rx, ry, sx, sy)
+        if abs(denominator) <= 1e-12:
+            if abs(_cross(qx, qy, rx, ry)) > 1e-9:
+                continue
+            ta = (qx * rx + qy * ry) / rr
+            tb = ((x1 - p0.x) * rx + (y1 - p0.y) * ry) / rr
+            overlap_start = max(0.0, min(ta, tb))
+            overlap_end = min(1.0, max(ta, tb))
+            if overlap_end - overlap_start > 1e-10:
+                # Point-in-polygon is ambiguous when the requested cut lies
+                # on the boundary.  OCC preserves those coincident intervals,
+                # so let the caller use the exact BRep fallback for this line.
+                return None
+            for value in (ta, tb):
+                if -1e-12 <= value <= 1.0 + 1e-12:
+                    cut_values.append(max(0.0, min(1.0, value)))
+            continue
+        t_value = _cross(qx, qy, sx, sy) / denominator
+        u_value = _cross(qx, qy, rx, ry) / denominator
+        if (-1e-12 <= t_value <= 1.0 + 1e-12
+                and -1e-12 <= u_value <= 1.0 + 1e-12):
+            cut_values.append(max(0.0, min(1.0, t_value)))
+
+    cut_values.sort()
+    deduped = []
+    for value in cut_values:
+        if not deduped or value - deduped[-1] > 1e-10:
+            deduped.append(value)
+
+    def _inside(x, y):
+        inside = False
+        for x0, y0, x1, y1 in all_segments:
+            if (y0 > y) == (y1 > y):
+                continue
+            crossing_x = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+            if x < crossing_x:
+                inside = not inside
+        return inside
+
+    def _distance_sq_to_segment(x, y, segment):
+        x0, y0, x1, y1 = segment
+        dx = x1 - x0
+        dy = y1 - y0
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-18:
+            return (x - x0) ** 2 + (y - y0) ** 2
+        fraction = ((x - x0) * dx + (y - y0) * dy) / length_sq
+        fraction = max(0.0, min(1.0, fraction))
+        px = x0 + fraction * dx
+        py = y0 + fraction * dy
+        return (x - px) ** 2 + (y - py) ** 2
+
+    direction = p1 - p0
+    direction_length = math.sqrt(rr)
+    extension = direction * (GEOMETRY_TOLERANCE / direction_length)
+    boundary_limit_sq = 0.1 * 0.1
+    clipped = []
+    for index in range(len(deduped) - 1):
+        start_t = deduped[index]
+        end_t = deduped[index + 1]
+        if end_t - start_t <= 1e-12:
+            continue
+        mid_t = (start_t + end_t) * 0.5
+        mid_x = p0.x + rx * mid_t
+        mid_y = p0.y + ry * mid_t
+        if not _inside(mid_x, mid_y):
+            continue
+        start = p0 + direction * start_t
+        end = p0 + direction * end_t
+        start_boundary = min(
+            _distance_sq_to_segment(start.x, start.y, segment)
+            for segment in outer_segments)
+        end_boundary = min(
+            _distance_sq_to_segment(end.x, end.y, segment)
+            for segment in outer_segments)
+        if (start_boundary >= boundary_limit_sq
+                or end_boundary >= boundary_limit_sq):
+            continue
+        clipped.append((start - extension, end + extension))
+    return clipped
+
+
+def _split_prismatic_board_2d(
+        unbent, cut_plan, plane_z, return_slices=False):
+    """Split a prismatic board and optionally return its partition wires."""
+    z_min = float(unbent.BoundBox.ZMin)
+    z_max = float(unbent.BoundBox.ZMax)
+    body_height = z_max - z_min
+    if body_height <= 1e-9:
+        raise ValueError("board body has no extrusion height")
+
+    wires = list(unbent.slice(FreeCAD.Vector(0, 0, 1), plane_z))
+    if not wires:
+        raise ValueError("board mid-plane slice produced no wires")
+    wire_order = _outline_wire_order(wires)
+    wires = [wires[index] for index in wire_order]
+    if len(wires) == 1:
+        profile = Part.Face(wires[0])
+    else:
+        profile = Part.Face(wires, "Part::FaceMakerBullseye")
+    if profile.isNull() or not profile.isValid():
+        raise ValueError("board mid-plane profile is invalid")
+
+    cut_edges = []
+    for entry in cut_plan:
+        start, end = entry[0], entry[1]
+        cut_edges.append(Part.makeLine(
+            FreeCAD.Vector(start.x, start.y, plane_z),
+            FreeCAD.Vector(end.x, end.y, plane_z)))
+    if not cut_edges:
+        raise ValueError("2D partition has no cut edges")
+
+    from BOPTools import SplitAPI
+    fragmented = SplitAPI.slice(profile, cut_edges, "Standard")
+    faces = [
+        face for face in getattr(fragmented, 'Faces', [])
+        if float(getattr(face, 'Area', 0.0)) > 1e-9
+    ]
+    if len(faces) <= 1:
+        raise ValueError(
+            f"2D partition produced only {len(faces)} face(s)")
+
+    profile_area = abs(float(profile.Area))
+    fragments_area = sum(abs(float(face.Area)) for face in faces)
+    area_tolerance = max(
+        1e-6, profile_area * PARTITION_RELATIVE_TOLERANCE)
+    if abs(fragments_area - profile_area) > area_tolerance:
+        raise ValueError(
+            "2D partition area mismatch: "
+            f"profile={profile_area:.9f}, fragments={fragments_area:.9f}")
+
+    faces.sort(key=lambda face: (
+        round(float(face.CenterOfMass.x), 10),
+        round(float(face.CenterOfMass.y), 10),
+        round(float(face.Area), 10)))
+    pieces = []
+    piece_slices = []
+    for face in faces:
+        if return_slices:
+            piece_slices.append(Part.Compound(list(face.Wires)))
+        flat_piece = face.copy()
+        flat_piece.translate(FreeCAD.Vector(0, 0, z_min - plane_z))
+        piece = flat_piece.extrude(FreeCAD.Vector(0, 0, body_height))
+        if piece.isNull() or not piece.isValid() or piece.Volume <= 1e-9:
+            raise ValueError("2D partition produced an invalid body piece")
+        pieces.append(piece)
+
+    source_volume = abs(float(unbent.Volume))
+    pieces_volume = sum(abs(float(piece.Volume)) for piece in pieces)
+    volume_tolerance = max(
+        1e-6, source_volume * PARTITION_RELATIVE_TOLERANCE)
+    if abs(pieces_volume - source_volume) > volume_tolerance:
+        raise ValueError(
+            "2D partition volume mismatch: "
+            f"board={source_volume:.9f}, pieces={pieces_volume:.9f}")
+    if return_slices:
+        return pieces, piece_slices
+    return pieces
 
 
 def _board_circle_radius_mm(circle):
@@ -2118,7 +2443,7 @@ class CouplerMarker:
         for parent in getattr(obj, 'InList', []):
             proxy = getattr(parent, "Proxy", None)
             if proxy and getattr(proxy, 'Type', None) in PCB_OBJECT_TYPES:
-                proxy._coupler_marker_changed(parent, obj)
+                proxy._coupler_marker_changed(parent, obj, prop)
                 break
 
     def dumps(self):
@@ -2298,7 +2623,7 @@ class _OutlineSketchObserver:
                 != 'CouplerMarker':
             parent = self._find_component_parent(obj)
             if parent is not None:
-                parent.Proxy._coupler_marker_changed(parent, obj)
+                parent.Proxy._coupler_marker_changed(parent, obj, prop)
             return
 
         # Constrain component Placement: only X/Y move + Z rotation
@@ -3607,6 +3932,7 @@ class PcbObject:
             if c.Name.endswith("_Board"):
                 board_obj = c
                 break
+        self._clear_bend_partition_cache()
         if board_obj and enable and active_bends:
             self._apply_bends(obj, board_obj, active_bends,
                               thickness, enable_bending=enable)
@@ -3691,7 +4017,89 @@ class PcbObject:
                 if isinstance(p, dict)
                 and (coupler_type is None or p.get('type') == coupler_type)]
 
-    def _coupler_marker_changed(self, obj, marker):
+    def _bend_partition_for_xy(self, x, y):
+        """Return the cached flat bend-piece index containing an XY point."""
+        pieces = getattr(self, '_bend_partition_pieces', None)
+        if not pieces:
+            return None
+        half_t = float(getattr(self, '_bend_partition_half_t', 0.0))
+        point = FreeCAD.Vector(float(x), float(y), half_t)
+        for tolerance in (0.01, 0.1, 0.5):
+            for index, piece in enumerate(pieces):
+                try:
+                    if piece.isInside(point, tolerance, True):
+                        return index
+                except Exception:
+                    continue
+        index, _distance = _nearest_bend_piece(
+            pieces, point,
+            excluded=getattr(self, '_bend_partition_strip_pieces', set()))
+        return index
+
+    def _coupler_bend_transform(self, marker, previous_pose, current_pose):
+        """Return the cached bend transform for an updated coupler pose."""
+        try:
+            old_x = float(previous_pose.get('x', 0.0))
+            old_y = float(previous_pose.get('y', 0.0))
+            new_x = float(current_pose.get('x', 0.0))
+            new_y = float(current_pose.get('y', 0.0))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        xy_changed = (abs(old_x - new_x) > 1e-12
+                      or abs(old_y - new_y) > 1e-12)
+        piece_indices = getattr(self, '_bend_child_piece_idx', None)
+        new_index = None
+        if not xy_changed and piece_indices is not None:
+            new_index = piece_indices.get(marker.Name)
+        if new_index is None:
+            new_index = self._bend_partition_for_xy(new_x, new_y)
+        transforms = getattr(self, '_bend_piece_placements', None)
+        if (new_index is not None and transforms is not None
+                and 0 <= new_index < len(transforms)):
+            if piece_indices is not None:
+                piece_indices[marker.Name] = new_index
+            try:
+                return transforms[new_index].copy()
+            except Exception:
+                return transforms[new_index]
+
+        # Runtime caches do not survive reopening an FCStd document.  A
+        # non-XY edit can still reuse the transform already carried by the
+        # displayed marker until the next normal board recompute rebuilds the
+        # cache.
+        if not xy_changed:
+            displayed = getattr(marker, 'Placement', None)
+            old_flat = getattr(marker, 'FreekiCAD_InitPlacement', None)
+            if displayed is not None and old_flat is not None:
+                try:
+                    return displayed.multiply(old_flat.inverse())
+                except Exception:
+                    pass
+        return None
+
+    def _set_coupler_marker_placement(self, marker, flat_placement,
+                                      bend_transform=None):
+        """Set a marker's flat pose and optional cached bend transform."""
+        retained = False
+        self._updating_coupler_markers = True
+        try:
+            if bend_transform is not None:
+                marker.Placement = bend_transform.multiply(flat_placement)
+                retained = True
+            else:
+                marker.Placement = flat_placement
+            marker.FreekiCAD_InitPlacement = flat_placement
+        finally:
+            self._updating_coupler_markers = False
+        if hasattr(self, '_unbent_placements'):
+            try:
+                self._unbent_placements[marker.Name] = flat_placement.copy()
+            except Exception:
+                self._unbent_placements[marker.Name] = flat_placement
+        return retained
+
+    def _coupler_marker_changed(self, obj, marker, prop=None):
         """Apply an edited marker locally and debounce its KiCad update."""
         if (getattr(self, '_updating_coupler_markers', False)
                 or getattr(self, '_reloading', False)
@@ -3708,6 +4116,7 @@ class PcbObject:
         if pose is None:
             return
 
+        previous_pose = dict(pose)
         pose.update({
             'x': _quantity_value(marker.X),
             'y': _quantity_value(marker.Y),
@@ -3720,17 +4129,12 @@ class PcbObject:
                               getattr(marker, 'Offset', 0)))
         obj.CouplerPoses = json.dumps(poses)
         placement = self._coupler_placement(pose)
-        self._updating_coupler_markers = True
-        try:
-            marker.Placement = placement
-            marker.FreekiCAD_InitPlacement = placement
-        finally:
-            self._updating_coupler_markers = False
-        if hasattr(self, '_unbent_placements'):
-            try:
-                self._unbent_placements[marker.Name] = placement.copy()
-            except Exception:
-                self._unbent_placements[marker.Name] = placement
+        bend_transform = None
+        if hasattr(self, '_unbent_board_shape'):
+            bend_transform = self._coupler_bend_transform(
+                marker, previous_pose, pose)
+        retained_bend = self._set_coupler_marker_placement(
+            marker, placement, bend_transform=bend_transform)
 
         if COUPLER_KICAD_SYNC_ENABLED:
             update = {
@@ -3748,7 +4152,10 @@ class PcbObject:
             self._schedule_coupler_update(obj, reference)
 
         if hasattr(self, '_unbent_board_shape'):
-            self._schedule_rebend(obj)
+            if retained_bend:
+                self._reposition_all_coupled_objects(obj.Document)
+            else:
+                self._schedule_rebend(obj)
         else:
             self._reposition_all_coupled_objects(obj.Document)
 
@@ -3978,6 +4385,10 @@ class PcbObject:
 
     def _apply_live_coupler_poses(self, obj, poses):
         """Update saved poses and markers, then repeat coupler positioning."""
+        previous = self._coupler_poses(obj)
+        retain_all_bends = (
+            hasattr(self, '_unbent_board_shape')
+            and len(previous) == len(poses))
         obj.CouplerPoses = json.dumps(poses)
         markers = {}
         for child in getattr(obj, 'Group', []):
@@ -3985,13 +4396,19 @@ class PcbObject:
                 key = (str(child.CouplerType), str(child.Reference))
                 markers.setdefault(key, []).append(child)
 
-        for pose in poses:
+        for pose_index, pose in enumerate(poses):
             key = (str(pose.get('type', '')), str(pose.get('ref', '')))
             matches = markers.get(key, [])
             if not matches:
                 continue
             marker = matches.pop(0)
             placement = self._coupler_placement(pose)
+            bend_transform = None
+            if retain_all_bends:
+                bend_transform = self._coupler_bend_transform(
+                    marker, previous[pose_index], pose)
+            retained_bend = self._set_coupler_marker_placement(
+                marker, placement, bend_transform=bend_transform)
             self._updating_coupler_markers = True
             try:
                 for prop, value in (
@@ -4004,21 +4421,19 @@ class PcbObject:
                         setattr(marker, prop, value)
                     except Exception:
                         pass
-                marker.Placement = placement
-                marker.FreekiCAD_InitPlacement = placement
             finally:
                 self._updating_coupler_markers = False
-            if hasattr(self, '_unbent_placements'):
-                try:
-                    self._unbent_placements[marker.Name] = placement.copy()
-                except Exception:
-                    self._unbent_placements[marker.Name] = placement
+            if not retained_bend:
+                retain_all_bends = False
 
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: Live couplers changed for '{obj.Label}'; "
             "repositioning linked boards\n")
         if hasattr(self, '_unbent_board_shape'):
-            self._rebend(obj)
+            if retain_all_bends:
+                self._reposition_all_coupled_objects(obj.Document)
+            else:
+                self._rebend(obj)
         else:
             self._reposition_all_coupled_objects(obj.Document)
 
@@ -4484,6 +4899,26 @@ class PcbObject:
         timer = self._surface_reload_timer
         return timer is not None and timer.isActive()
 
+    def _clear_bend_partition_cache(self):
+        """Discard runtime-only flat-piece lookup and transform data."""
+        for name in (
+                '_bend_partition_pieces',
+                '_bend_partition_strip_pieces',
+                '_bend_partition_half_t',
+                '_bend_child_piece_idx',
+                '_bend_piece_placements',
+                '_bend_partition_signature',
+                '_bend_partition_piece_slices',
+                '_bend_partition_cut_touching_pieces',
+                '_bend_partition_piece_touching_cuts',
+                '_bend_cached_piece_shapes',
+                '_bend_cached_piece_placement_signatures',
+                '_bend_cached_strip_pieces'):
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass
+
     def _rebend(self, obj):
         """Re-apply bending after Radius/Angle/Active or EnableBending
         changes on a bend line."""
@@ -4557,6 +4992,8 @@ class PcbObject:
             if enable and active_bends and board_obj:
                 self._apply_bends(obj, board_obj, active_bends,
                                   thickness)
+            else:
+                self._clear_bend_partition_cache()
             self._capture_component_bend_placements(obj)
         finally:
             self._bending = False
@@ -4583,6 +5020,14 @@ class PcbObject:
         import time as _time
         _t0_total = _time.time()
         unbent = getattr(self, '_unbent_board_shape', board_obj.Shape)
+        previous_partition_signature = getattr(
+            self, '_bend_partition_signature', None)
+        previous_piece_shapes = getattr(
+            self, '_bend_cached_piece_shapes', None)
+        previous_placement_signatures = getattr(
+            self, '_bend_cached_piece_placement_signatures', None)
+        previous_strip_pieces = getattr(
+            self, '_bend_cached_strip_pieces', set())
         # Use the bounding box center as the reference point for
         # bend normal orientation and stationary piece selection.
         # BoundBox.Center is always well-defined, even for shapes
@@ -4617,6 +5062,7 @@ class PcbObject:
                               math.radians(angle_deg), radius))
 
         if not bend_info:
+            self._clear_bend_partition_cache()
             self._update_conflicts_debug_object(obj, None, thickness)
             return
 
@@ -4719,6 +5165,7 @@ class PcbObject:
                     conflict_shape = conflict_shapes[0]
             self._clear_bend_debug_artifacts(
                 obj, board_obj=board_obj)
+            self._clear_bend_partition_cache()
             self._update_conflicts_debug_object(
                 obj, conflict_shape, thickness)
             state = "disabling bending" if enable_bending \
@@ -4739,6 +5186,7 @@ class PcbObject:
         #          p0, normal, bend_obj, moving_normal)
         cut_plan = []
         trimmed_bend_segs = []  # per bend: list of (sp0, sp1)
+        linear_outline = _linear_outline_data(board_face)
 
         def _project_point_to_segment_xy(pt, seg_p0, seg_p1):
             sx = seg_p1.x - seg_p0.x
@@ -4763,7 +5211,7 @@ class PcbObject:
                  angle_rad, radius) in enumerate(bend_info):
             ins = insets[bi]
             bl_segs = self._trim_line_to_outline(
-                p0, p1, board_face)
+                p0, p1, board_face, linear_outline)
             if not bl_segs:
                 bl_segs = [(p0, p1)]
             trimmed_bend_segs.append(bl_segs)
@@ -4774,11 +5222,11 @@ class PcbObject:
             b_p0 = p0 + normal * ins
             b_p1 = p1 + normal * ins
             a_segs = self._trim_line_to_outline(
-                a_p0, a_p1, board_face)
+                a_p0, a_p1, board_face, linear_outline)
             if not a_segs:
                 a_segs = [(a_p0, a_p1)]
             b_segs = self._trim_line_to_outline(
-                b_p0, b_p1, board_face)
+                b_p0, b_p1, board_face, linear_outline)
             if not b_segs:
                 b_segs = [(b_p0, b_p1)]
             for sp0, sp1 in a_segs:
@@ -4793,15 +5241,20 @@ class PcbObject:
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] Phase 2a (2D cut plan): "
             f"{_time.time() - _t_phase2a:.3f}s\n")
-        # --- Phase 2b: create 3D cutting faces from 2D plan ---
+        partition_signature = _bend_partition_signature(
+            cut_plan, thickness)
+        # --- Phase 2b: attach topology metadata to the 2D cut plan ---
         _t_phase2b = _time.time()
         # Each stationary-side cut segment → independent micro-bend.
         # Moving-side cuts → geometry only (no micro-bend, no rotation).
         # After 2D planning, everything is per cut line.
-        cut_faces = []
+        # Vertical faces are expensive and only needed by the 3D partition or
+        # distance fallbacks.  Keep index-compatible empty slots and construct
+        # each face lazily if a fallback is actually used.
+        cut_faces = [None] * len(cut_plan)
         micro_bend_info = []  # per micro-bend: (angle, bend_obj,
                               #   cut_mid, normal, radius, orig_bi)
-        # --- Phase 2b-1: create cut faces with generic bend labels ---
+        # --- Phase 2b-1: label cuts with generic bend labels ---
         # Both geometric sides get the same label (bi) initially.
         # Stationary/moving role is determined per crossing via BFS.
         face_to_micro = {}  # fi → label (initially all bi)
@@ -4810,7 +5263,24 @@ class PcbObject:
         cut_plan_data = {}  # fi → (angle_rad, bend_obj, cut_mid,
                             #       normal, radius, bi)
 
-        for entry in cut_plan:
+        def _vertical_cut_face(fi):
+            face = cut_faces[fi]
+            if face is not None:
+                return face
+            sp0, sp1 = cut_plan[fi][0], cut_plan[fi][1]
+            c1 = sp0 - up * diag
+            c2 = sp1 - up * diag
+            c3 = sp1 + up * diag
+            c4 = sp0 + up * diag
+            face = Part.Face(Part.makePolygon([c1, c2, c3, c4, c1]))
+            cut_faces[fi] = face
+            return face
+
+        def _all_vertical_cut_faces():
+            return [
+                _vertical_cut_face(fi) for fi in range(len(cut_plan))]
+
+        for fi, entry in enumerate(cut_plan):
             sp0, sp1 = entry[0], entry[1]
             side, bi = entry[2], entry[3]
             angle_rad = entry[4]
@@ -4818,14 +5288,6 @@ class PcbObject:
             p0_ref = entry[6]
             normal_ref = entry[7]
             bend_obj_ref = entry[8]
-
-            fi = len(cut_faces)
-            c1 = sp0 - up * diag
-            c2 = sp1 - up * diag
-            c3 = sp1 + up * diag
-            c4 = sp0 + up * diag
-            cut_faces.append(
-                Part.Face(Part.makePolygon([c1, c2, c3, c4, c1])))
 
             cut_mid = (sp0 + sp1) * 0.5
             face_topo_side[fi] = side
@@ -4837,63 +5299,107 @@ class PcbObject:
                                  normal_ref, radius, bi)
 
         FreeCAD.Console.PrintMessage(
-            f"FreekiCAD: [profile] Phase 2b (3D cut faces): "
+            f"FreekiCAD: [profile] Phase 2b (cut metadata): "
             f"{_time.time() - _t_phase2b:.3f}s\n")
         # --- Phase 2c: cut board, assign stationary/moving ---
         _t_phase2c = _time.time()
         _t_fuse = _time.time()
-        try:
-            # NOTE: generalFuse returns a map of input→output face
-            # images, but we don't use it for adjacency because:
-            # (1) the map only tracks faces, missing edge/vertex
-            #     adjacency between pieces;
-            # (2) pieces filtered by Volume don't correspond 1:1
-            #     to compound solids, making face ownership fragile.
-            # Instead we slice pieces to 2D and use distToShape on
-            # the lightweight 2D wires.
-            fused, _map = unbent.generalFuse(cut_faces)
-            pieces = [s for s in fused.Solids if s.Volume > 1e-6]
-        except Exception:
-            pieces = []
+        partition_piece_slices = None
+        reuse_partition = (
+            getattr(self, '_bend_partition_signature', None)
+            == partition_signature
+            and bool(getattr(self, '_bend_partition_pieces', None))
+            and bool(getattr(
+                self, '_bend_partition_piece_slices', None)))
+        if reuse_partition:
+            pieces = self._bend_partition_pieces
+            partition_method = "cached pieces"
+        else:
+            try:
+                pieces, partition_piece_slices = \
+                    _split_prismatic_board_2d(
+                        unbent, cut_plan, half_t,
+                        return_slices=True)
+                partition_method = "2D split + extrusion"
+            except Exception as ex:
+                FreeCAD.Console.PrintWarning(
+                    f"FreekiCAD: 2D board partition failed: {ex}; "
+                    "using 3D generalFuse fallback\n")
+                try:
+                    # Keep the prior solid/face boolean as a compatibility
+                    # fallback for unusual or invalid planar topology.
+                    fused, _map = unbent.generalFuse(
+                        _all_vertical_cut_faces())
+                    pieces = [
+                        solid for solid in fused.Solids
+                        if solid.Volume > 1e-6]
+                except Exception:
+                    pieces = []
+                partition_method = "3D generalFuse fallback"
         FreeCAD.Console.PrintMessage(
-            f"FreekiCAD: [profile] generalFuse: "
+            f"FreekiCAD: [profile] board partition: "
             f"{_time.time() - _t_fuse:.3f}s "
-            f"({len(pieces)} pieces)\n")
+            f"({len(pieces)} pieces, {partition_method})\n")
 
         # Build 2D slices of pieces for fast adjacency checks.
         # The board is flat — slicing at z=half_t gives 2D wires
         # that are orders of magnitude cheaper than 3D distToShape.
         _t_slices = _time.time()
-        piece_slices = []
-        for piece in pieces:
-            wires = piece.slice(FreeCAD.Vector(0, 0, 1), half_t)
-            if wires:
-                piece_slices.append(Part.Compound(wires))
-            else:
-                piece_slices.append(piece)  # fallback to 3D
+        if reuse_partition:
+            piece_slices = self._bend_partition_piece_slices
+        elif partition_piece_slices is not None:
+            piece_slices = partition_piece_slices
+        else:
+            piece_slices = []
+            for piece in pieces:
+                wires = piece.slice(FreeCAD.Vector(0, 0, 1), half_t)
+                if wires:
+                    piece_slices.append(Part.Compound(wires))
+                else:
+                    piece_slices.append(piece)  # fallback to 3D
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] 2D piece slices: "
             f"{_time.time() - _t_slices:.3f}s\n")
         wedge_assign_diag = getattr(obj, 'BuildDebugObjects', False)
 
-        def _piece_segment_debug_metrics(piece, seg_p0, seg_p1):
-            cm = piece.CenterOfMass
+        # Accessing TopoShape properties crosses the Python/OCCT boundary.
+        # Joint seeding tests every piece against many bend segments, so cache
+        # the immutable flat-piece data once instead of fetching it in every
+        # pairwise test.
+        _t_joint_seed = _time.time()
+        piece_metric_data = []
+        for piece in pieces:
+            bbox = piece.BoundBox
+            piece_metric_data.append((
+                piece.CenterOfMass,
+                None,
+                bbox,
+                (float(bbox.XMin), float(bbox.YMin),
+                 float(bbox.XMax), float(bbox.YMax)),
+            ))
+
+        def _piece_segment_debug_metrics(pi, seg_p0, seg_p1):
+            cm, vertex_points, bbox, bbox_xy = piece_metric_data[pi]
+            if vertex_points is None:
+                vertex_points = tuple(
+                    vertex.Point for vertex in pieces[pi].Vertexes)
+                piece_metric_data[pi] = (
+                    cm, vertex_points, bbox, bbox_xy)
             cm_t_raw, cm_t, cm_d = _project_point_to_segment_xy(
                 cm, seg_p0, seg_p1)
             vertex_line_d = []
             vertex_t_raw = []
             vertex_t = []
             vertex_d = []
-            for vertex in getattr(piece, 'Vertexes', []):
+            for point in vertex_points:
                 _, d_line_v = _project_point_to_line_xy(
-                    vertex.Point, seg_p0, seg_p1)
+                    point, seg_p0, seg_p1)
                 t_raw_v, t_v, d_v = _project_point_to_segment_xy(
-                    vertex.Point, seg_p0, seg_p1)
+                    point, seg_p0, seg_p1)
                 vertex_line_d.append(d_line_v)
                 vertex_t_raw.append(t_raw_v)
                 vertex_t.append(t_v)
                 vertex_d.append(d_v)
-            bbox = getattr(piece, 'BoundBox', None)
             return {
                 'cm_t_raw': cm_t_raw,
                 'cm_t': cm_t,
@@ -4910,6 +5416,31 @@ class PcbObject:
                 'bbox': bbox,
             }
 
+        def _bbox_may_overlap_segment_band(
+                bbox_xy, seg_p0, seg_p1, band_limit, tol_t):
+            """Conservatively reject boxes outside a segment-aligned band."""
+            x_min, y_min, x_max, y_max = bbox_xy
+            sx = seg_p1.x - seg_p0.x
+            sy = seg_p1.y - seg_p0.y
+            sl2 = sx * sx + sy * sy
+            if sl2 < 1e-12:
+                return True
+            seg_len = math.sqrt(sl2)
+            t_values = []
+            line_values = []
+            for x, y in (
+                    (x_min, y_min), (x_min, y_max),
+                    (x_max, y_min), (x_max, y_max)):
+                dx = x - seg_p0.x
+                dy = y - seg_p0.y
+                t_values.append((dx * sx + dy * sy) / sl2)
+                line_values.append((sx * dy - sy * dx) / seg_len)
+            if max(t_values) < -tol_t or min(t_values) > 1.0 + tol_t:
+                return False
+            return not (
+                min(line_values) > band_limit
+                or max(line_values) < -band_limit)
+
         # Build 2D cut segments for adjacency face matching.
         cut_segments = []
         for fi in range(len(cut_faces)):
@@ -4918,6 +5449,62 @@ class PcbObject:
                 FreeCAD.Vector(sp0.x, sp0.y, half_t),
                 FreeCAD.Vector(sp1.x, sp1.y, half_t))
             cut_segments.append(edge_2d)
+
+        # Compute every piece/cut contact once.  Wedge rescue, cut ownership,
+        # adjacency, and diagnostics all consume this same incidence map.
+        _t_incidence = _time.time()
+        cached_cut_touching = getattr(
+            self, '_bend_partition_cut_touching_pieces', None)
+        cached_piece_touching = getattr(
+            self, '_bend_partition_piece_touching_cuts', None)
+        reuse_incidence = (
+            reuse_partition
+            and cached_cut_touching is not None
+            and cached_piece_touching is not None
+            and len(cached_cut_touching) == len(cut_segments)
+            and len(cached_piece_touching) == len(pieces))
+        distance_checks = 0
+        if reuse_incidence:
+            cut_touching_pieces = [
+                set(touching) for touching in cached_cut_touching]
+            piece_touching_cuts = [
+                set(touching) for touching in cached_piece_touching]
+        else:
+            cut_touching_pieces = [set() for _ in cut_segments]
+            piece_touching_cuts = [set() for _ in pieces]
+            for fi, cut_segment in enumerate(cut_segments):
+                cut_bb = cut_segment.BoundBox
+                for pi, piece_slice in enumerate(piece_slices):
+                    piece_bb = piece_slice.BoundBox
+                    if (piece_bb.XMax
+                            < cut_bb.XMin - GEOMETRY_TOLERANCE
+                            or piece_bb.XMin
+                            > cut_bb.XMax + GEOMETRY_TOLERANCE
+                            or piece_bb.YMax
+                            < cut_bb.YMin - GEOMETRY_TOLERANCE
+                            or piece_bb.YMin
+                            > cut_bb.YMax + GEOMETRY_TOLERANCE):
+                        continue
+                    distance_checks += 1
+                    try:
+                        touching = (piece_slice.distToShape(
+                            cut_segment)[0] < GEOMETRY_TOLERANCE)
+                    except Exception:
+                        try:
+                            touching = (pieces[pi].distToShape(
+                                _vertical_cut_face(fi))[0]
+                                < GEOMETRY_TOLERANCE)
+                        except Exception:
+                            touching = False
+                    if touching:
+                        cut_touching_pieces[fi].add(pi)
+                        piece_touching_cuts[pi].add(fi)
+        FreeCAD.Console.PrintMessage(
+            f"FreekiCAD: [profile] piece/cut incidence: "
+            f"{'reused' if reuse_incidence else 'rebuilt'}, "
+            f"checks={distance_checks}/"
+            f"{len(pieces) * len(cut_segments)}, "
+            f"elapsed={_time.time() - _t_incidence:.3f}s\n")
 
         # Build joints.  Each trimmed center segment
         # is one joint containing: the center seg, zero-or-more A
@@ -4989,8 +5576,13 @@ class PcbObject:
                 for pi, piece in enumerate(pieces):
                     if pi in strip_pieces:
                         continue
+                    if not _bbox_may_overlap_segment_band(
+                            piece_metric_data[pi][3],
+                            bl_sp0, bl_sp1,
+                            ins + seed_tol, tol_t):
+                        continue
                     metrics = _piece_segment_debug_metrics(
-                        piece, bl_sp0, bl_sp1)
+                        pi, bl_sp0, bl_sp1)
                     if math.isnan(metrics['t_raw_min']):
                         continue
                     if math.isnan(metrics['t_raw_max']):
@@ -5006,11 +5598,13 @@ class PcbObject:
                     strip_pieces.add(pi)
                     strip_to_bend[pi] = bi
                     strip_to_seg[pi] = sid
+        _dt_joint_seed = _time.time() - _t_joint_seed
 
         # Rescue any still-unmatched A/B cut faces using the whole 2D cut
         # segment instead of only the cut midpoint. This catches branch/
         # concavity cases where the face is visibly part of a trimmed bend
         # segment but its midpoint falls outside the inset band.
+        _t_face_rescue = _time.time()
         center_segments_2d = []
         for joint in joints:
             seg_p0, seg_p1 = joint['center']
@@ -5093,6 +5687,7 @@ class PcbObject:
                     f" bend={face_bend.get(fi)}"
                     f" side={side}"
                     f" sid={sid}\n")
+        _dt_face_rescue = _time.time() - _t_face_rescue
 
         # Rescue any still-unassigned strip pieces using the matched cut
         # faces they actually touch, instead of only their center of mass.
@@ -5100,6 +5695,7 @@ class PcbObject:
         # either both A/B faces of a single trimmed segment, or neighboring
         # trimmed segments on opposite topo sides (for branched strips such as
         # p162 in maze_radius_skewed).
+        _t_piece_rescue = _time.time()
         piece_bend_touch = {}  # pi -> bi -> {'sids', 'sides', 'sid_sides'}
         for fi, sid in face_to_seg.items():
             bi = face_bend.get(fi)
@@ -5108,15 +5704,8 @@ class PcbObject:
             side = face_topo_side.get(fi)
             if side not in ('A', 'B'):
                 continue
-            cut_shape = cut_segments[fi]
-            for pi in range(len(pieces)):
+            for pi in sorted(cut_touching_pieces[fi]):
                 if pi in strip_pieces:
-                    continue
-                try:
-                    d_touch = piece_slices[pi].distToShape(cut_shape)[0]
-                except Exception:
-                    d_touch = float('inf')
-                if d_touch >= GEOMETRY_TOLERANCE:
                     continue
                 bend_touch = piece_bend_touch.setdefault(pi, {})
                 touch = bend_touch.setdefault(bi, {
@@ -5200,7 +5789,7 @@ class PcbObject:
                                 f" limit={ins + GEOMETRY_TOLERANCE:.6f}\n")
                         continue
                     metrics = _piece_segment_debug_metrics(
-                        pieces[pi], seg_p0, seg_p1)
+                        pi, seg_p0, seg_p1)
                     tol_t = GEOMETRY_TOLERANCE / seg_len
                     if (metrics['t_raw_max'] < -tol_t
                             or metrics['t_raw_min'] > 1.0 + tol_t):
@@ -5259,9 +5848,10 @@ class PcbObject:
                     f" sid={sid}"
                     f" touch_sids={sorted(touch['sids'])}"
                     f" touch_sides={sorted(touch['sides'])}\n")
+        _dt_piece_rescue = _time.time() - _t_piece_rescue
 
+        _t_pairing_diag = _time.time()
         if wedge_assign_diag:
-            tol = GEOMETRY_TOLERANCE
             for sid, joint in enumerate(joints):
                 seg_p0, seg_p1 = joint['center']
                 sx = seg_p1.x - seg_p0.x
@@ -5276,16 +5866,8 @@ class PcbObject:
                 for pi in joint['wedges']:
                     piece = pieces[pi]
                     metrics = _piece_segment_debug_metrics(
-                        piece, seg_p0, seg_p1)
-                    touch_faces = []
-                    for fi in range(len(cut_faces)):
-                        try:
-                            d_touch = piece_slices[pi].distToShape(
-                                cut_segments[fi])[0]
-                        except Exception:
-                            d_touch = float('inf')
-                        if d_touch < tol:
-                            touch_faces.append(fi)
+                        pi, seg_p0, seg_p1)
+                    touch_faces = sorted(piece_touching_cuts[pi])
                     touch_sids = sorted(set(
                         face_to_seg[fi]
                         for fi in touch_faces
@@ -5319,18 +5901,16 @@ class PcbObject:
                             f"FreekiCAD:   wedge-src p{pi}"
                             f" assigned_sid={sid}"
                             f" but touches_sid={touch_sids}\n")
+        _dt_pairing_diag = _time.time() - _t_pairing_diag
 
         # Map each debug cut to the rigid piece that owns that edge.
         # The final debug line should follow the same rigid transform as
         # the piece adjacent to that cut, rather than approximating the
         # result from the bend line placement alone.
+        _t_cut_owner = _time.time()
         cut_owner_piece = {}
-        for fi, cut_seg in enumerate(cut_segments):
-            touching = []
-            for pi in range(len(pieces)):
-                if piece_slices[pi].distToShape(
-                        cut_seg)[0] < GEOMETRY_TOLERANCE:
-                    touching.append(pi)
+        for fi in range(len(cut_segments)):
+            touching = cut_touching_pieces[fi]
             rigid_touching = [pi for pi in touching
                               if pi not in strip_pieces]
             if len(rigid_touching) == 1:
@@ -5354,8 +5934,16 @@ class PcbObject:
                                 pieces[pi].CenterOfMass
                                 - p0_ref).dot(normal_ref))
                     cut_owner_piece[fi] = owner_pi
+        _dt_cut_owner = _time.time() - _t_cut_owner
 
         # Build geometric crossings and BFS for s/m assignment.
+        FreeCAD.Console.PrintMessage(
+            "FreekiCAD: [profile] Phase 2c stages: "
+            f"joint-seed={_dt_joint_seed:.3f}s, "
+            f"face-rescue={_dt_face_rescue:.3f}s, "
+            f"piece-rescue={_dt_piece_rescue:.3f}s, "
+            f"diagnostics={_dt_pairing_diag:.3f}s, "
+            f"cut-owner={_dt_cut_owner:.3f}s\n")
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] Phase 2c (pairing): "
             f"{_time.time() - _t_phase2c:.3f}s\n")
@@ -5365,7 +5953,8 @@ class PcbObject:
             piece_slices=piece_slices,
             cut_segments=cut_segments,
             joints=joints,
-            face_to_seg=face_to_seg)
+            face_to_seg=face_to_seg,
+            cut_touching_pieces=cut_touching_pieces)
 
         # Stationary piece = closest non-wedge piece to board
         # outline center of mass.
@@ -5478,10 +6067,8 @@ class PcbObject:
                     is_stationary = side_dot > side_tol
                 if not is_stationary and abs(side_dot) <= side_tol:
                     # Local geometry is too close to the bend line; fall back
-                    # to direct face contact as a tie-breaker.
-                    is_stationary = (
-                        pieces[parent_pi].distToShape(
-                            cut_faces[fi])[0] < GEOMETRY_TOLERANCE)
+                    # to the already-computed cut incidence as a tie-breaker.
+                    is_stationary = parent_pi in cut_touching_pieces[fi]
             # Reuse mi if partner face already processed
             if sid is not None and sid in sid_to_mi:
                 mi = sid_to_mi[sid]
@@ -5535,12 +6122,13 @@ class PcbObject:
             bend_seg_mids.setdefault(bi, []).append(
                 FreeCAD.Vector(cut_mid))
             bend_s_mis.setdefault(bi, []).append(mi)
-            FreeCAD.Console.PrintMessage(
+            _log_bending_bfs(
                 f"FreekiCAD: mi={mi} bend={bi}"
                 f" seg={seg_idx}"
                 f" angle={math.degrees(angle_rad):.1f}°"
                 f" normal=({normal_ref.x:.3f},{normal_ref.y:.3f},{normal_ref.z:.3f})"
-                f"\n")
+                f"\n",
+                wedge_assign_diag)
 
         # BFS with stationary/moving labels
         FreeCAD.Console.PrintMessage(
@@ -5553,6 +6141,7 @@ class PcbObject:
             self._classify_pieces_bfs(
                 pieces, cut_faces, face_to_bend, mass_center,
                 half_t, bend_info, cut_plan, micro_bend_info,
+                log=wedge_assign_diag,
                 mi_seg_idx=mi_seg_idx,
                 cached_geo_crossings=geo_crossings,
                 strip_pieces=strip_pieces,
@@ -5698,7 +6287,7 @@ class PcbObject:
                 if seg_len < 1e-12:
                     continue
                 metrics = _piece_segment_debug_metrics(
-                    pieces[pi], seg_p0, seg_p1)
+                    pi, seg_p0, seg_p1)
                 band_margin = max(
                     GEOMETRY_TOLERANCE,
                     min(insets[promote_bi] * 0.15, 0.05))
@@ -5943,22 +6532,27 @@ class PcbObject:
                 bendline_bend_sets[child.Name] = fb
 
         # Log bend line piece assignments
-        for child in obj.Group:
-            if (getattr(getattr(child, 'Proxy', None),
-                        'Type', None) != 'BendLine'):
-                continue
-            bl_pi = bendline_piece_idx.get(child.Name)
-            bl_set = bendline_bend_sets.get(child.Name, set())
-            if bl_pi is not None:
-                FreeCAD.Console.PrintMessage(
-                    f"FreekiCAD: bendline {child.Name}"
-                    f" in piece {bl_pi}"
-                    f" set={sorted(bl_set)}\n")
+        if wedge_assign_diag:
+            for child in obj.Group:
+                if (getattr(getattr(child, 'Proxy', None),
+                            'Type', None) != 'BendLine'):
+                    continue
+                bl_pi = bendline_piece_idx.get(child.Name)
+                bl_set = bendline_bend_sets.get(child.Name, set())
+                if bl_pi is not None:
+                    _log_bending_bfs(
+                        f"FreekiCAD: bendline {child.Name}"
+                        f" in piece {bl_pi}"
+                        f" set={sorted(bl_set)}\n",
+                        True)
 
         # --- Phase 3: apply bends sequentially using pre-cut pieces ---
         _t_phase3 = _time.time()
         up = FreeCAD.Vector(0, 0, 1)
-        piece_shapes = [p.copy() for p in pieces]
+        # Phase 3 accumulates placements without mutating geometry. Allocate
+        # result slots now and copy each source solid only once when its final
+        # transform is materialized below.
+        piece_shapes = [None] * len(pieces)
         wedge_diag = getattr(obj, 'BuildDebugObjects', False)
 
         # strip_pieces and strip_to_bend already computed before BFS.
@@ -6178,14 +6772,17 @@ class PcbObject:
                     else:
                         piece_mi_list[wpi] = parent_chain + [mi_w]
 
-        for pi in range(len(pieces)):
-            angles = [f"{math.degrees(micro_bend_info[mi][0]):.1f}°"
-                      for mi in piece_mi_list[pi]]
-            _log_bending_bfs(
-                f"FreekiCAD: piece_mi_list[{pi}]"
-                f" = {piece_mi_list[pi]}"
-                f" angles={angles}"
-                f" strip={pi in strip_pieces}\n")
+        if wedge_diag:
+            for pi in range(len(pieces)):
+                angles = [
+                    f"{math.degrees(micro_bend_info[mi][0]):.1f}°"
+                    for mi in piece_mi_list[pi]]
+                _log_bending_bfs(
+                    f"FreekiCAD: piece_mi_list[{pi}]"
+                    f" = {piece_mi_list[pi]}"
+                    f" angles={angles}"
+                    f" strip={pi in strip_pieces}\n",
+                    True)
 
         # Helper: does piece pi rotate at this step?
         def _at_step(pi, step_pos, mi):
@@ -6228,21 +6825,24 @@ class PcbObject:
             return path
 
         # Log piece_mi_list for neighbours of stationary piece
-        for pi in range(len(pieces)):
-            entry = bfs_tree.get(pi)
-            if entry is not None and entry[0] == stationary_idx:
-                _log_bending_bfs(
-                    f"FreekiCAD: piece_mi_list[{pi}]"
-                    f" (neighbour of fixed p{stationary_idx})"
-                    f" = {piece_mi_list[pi]}"
-                    f" strip={pi in strip_pieces}\n")
-            # Also log if entry[2] is wedge that connects to fixed
-            if (entry is not None and entry[2] is not None
-                    and entry[0] == stationary_idx):
-                _log_bending_bfs(
-                    f"FreekiCAD: p{pi} reaches fixed"
-                    f" via wedge p{entry[2]}"
-                    f" crossed={sorted(entry[1])}\n")
+        if wedge_diag:
+            for pi in range(len(pieces)):
+                entry = bfs_tree.get(pi)
+                if entry is not None and entry[0] == stationary_idx:
+                    _log_bending_bfs(
+                        f"FreekiCAD: piece_mi_list[{pi}]"
+                        f" (neighbour of fixed p{stationary_idx})"
+                        f" = {piece_mi_list[pi]}"
+                        f" strip={pi in strip_pieces}\n",
+                        True)
+                # Also log if entry[2] is wedge that connects to fixed
+                if (entry is not None and entry[2] is not None
+                        and entry[0] == stationary_idx):
+                    _log_bending_bfs(
+                        f"FreekiCAD: p{pi} reaches fixed"
+                        f" via wedge p{entry[2]}"
+                        f" crossed={sorted(entry[1])}\n",
+                        True)
 
         # Track accumulated transform per piece (for virtual_plc).
         piece_plc = [FreeCAD.Placement() for _ in range(len(pieces))]
@@ -6313,10 +6913,12 @@ class PcbObject:
             bend_sign = -1.0 if micro_angle > 0 else 1.0
             stat_edge_mid = cur_p0 + cur_up * half_t
             pivot = stat_edge_mid + cur_up * (r_eff_bi * bend_sign)
-            _log_bending_bfs(
-                f"FreekiCAD: mi {mi} CoC:"
-                f" pivot=({pivot.x:.4f},{pivot.y:.4f},"
-                f"{pivot.z:.4f})\n")
+            if wedge_diag:
+                _log_bending_bfs(
+                    f"FreekiCAD: mi {mi} CoC:"
+                    f" pivot=({pivot.x:.4f},{pivot.y:.4f},"
+                    f"{pivot.z:.4f})\n",
+                    True)
 
             # Save pivot data for wedge loft (first occurrence only)
             if first_mi_occurrence:
@@ -6337,45 +6939,55 @@ class PcbObject:
             if first_mi_occurrence:
                 for wpi in strip_pieces:
                     if strip_to_mi.get(wpi) == mi:
-                        wedge_pre_shapes[wpi] = \
-                            piece_shapes[wpi].copy()
-                        wedge_pre_plc[wpi] = piece_plc[wpi].copy()
+                        pre_plc = piece_plc[wpi].copy()
+                        pre_shape = pieces[wpi].copy()
+                        pre_shape.transformShape(pre_plc.toMatrix())
+                        wedge_pre_shapes[wpi] = pre_shape
+                        wedge_pre_plc[wpi] = pre_plc
 
-            _log_bending_bfs(
-                f"FreekiCAD: micro {mi}:"
-                f" angle={math.degrees(micro_angle):.1f}°,"
-                f" orig_bi={orig_bi},"
-                f" pivot={pivot}, axis={bend_axis}\n")
+            if wedge_diag:
+                _log_bending_bfs(
+                    f"FreekiCAD: micro {mi}:"
+                    f" angle={math.degrees(micro_angle):.1f}°,"
+                    f" orig_bi={orig_bi},"
+                    f" pivot={pivot}, axis={bend_axis}\n",
+                    True)
 
             # Rotate pieces by full angle around CoC.
             rot = FreeCAD.Rotation(
                 bend_axis, math.degrees(micro_angle))
             plc_rot = FreeCAD.Placement(
                 FreeCAD.Vector(0, 0, 0), rot, pivot)
-            rotated_pis = []
+            rotated_pis = [] if wedge_diag else None
             for pi in range(len(piece_shapes)):
                 if not _at_step(pi, step_pos, mi):
                     continue
-                pre_cm = piece_shapes[pi].CenterOfMass
-                piece_shapes[pi].transformShape(
-                    plc_rot.toMatrix())
+                entry_dbg = bfs_tree.get(pi) if wedge_diag else None
+                log_fixed_neighbor = (
+                    entry_dbg is not None
+                    and entry_dbg[0] == stationary_idx)
+                if log_fixed_neighbor:
+                    pre_cm = piece_plc[pi].multVec(
+                        pieces[pi].CenterOfMass)
                 piece_plc[pi] = plc_rot.multiply(piece_plc[pi])
-                post_cm = piece_shapes[pi].CenterOfMass
-                rotated_pis.append(pi)
-                # Log z-change for pieces near fixed
-                entry_dbg = bfs_tree.get(pi)
-                if (entry_dbg is not None
-                        and entry_dbg[0] == stationary_idx):
+                if wedge_diag:
+                    rotated_pis.append(pi)
+                if log_fixed_neighbor:
+                    post_cm = piece_plc[pi].multVec(
+                        pieces[pi].CenterOfMass)
                     _log_bending_bfs(
                         f"FreekiCAD:   mi {mi} rotated"
                         f" p{pi} (fixed-nbr):"
                         f" z {pre_cm.z:.4f}"
-                        f" → {post_cm.z:.4f}\n")
-            _log_bending_bfs(
-                f"FreekiCAD:   mi {mi} rotated"
-                f" {len(rotated_pis)} pieces:"
-                f" {rotated_pis[:10]}"
-                f"{'...' if len(rotated_pis) > 10 else ''}\n")
+                        f" → {post_cm.z:.4f}\n",
+                        True)
+            if wedge_diag:
+                _log_bending_bfs(
+                    f"FreekiCAD:   mi {mi} rotated"
+                    f" {len(rotated_pis)} pieces:"
+                    f" {rotated_pis[:10]}"
+                    f"{'...' if len(rotated_pis) > 10 else ''}\n",
+                    True)
 
             # Save wedge's piece_plc right after its own mi rotation
             # (only on first occurrence of this mi)
@@ -6453,18 +7065,20 @@ class PcbObject:
                 correction = mid_expected - mid_actual
 
                 if correction.Length > 1e-6:
-                    _log_bending_bfs(
-                        f"FreekiCAD: correction mi {mi}"
-                        f" (bend {orig_bi}):"
-                        f" ins={ins_bi:.4f}"
-                        f" r_eff={r_eff_corr:.4f}"
-                        f" angle="
-                        f"{math.degrees(mi_angle_corr):.1f}°"
-                        f" |corr|="
-                        f"{correction.Length:.4f}"
-                        f" vec=({correction.x:.4f},"
-                        f"{correction.y:.4f},"
-                        f"{correction.z:.4f})\n")
+                    if wedge_diag:
+                        _log_bending_bfs(
+                            f"FreekiCAD: correction mi {mi}"
+                            f" (bend {orig_bi}):"
+                            f" ins={ins_bi:.4f}"
+                            f" r_eff={r_eff_corr:.4f}"
+                            f" angle="
+                            f"{math.degrees(mi_angle_corr):.1f}°"
+                            f" |corr|="
+                            f"{correction.Length:.4f}"
+                            f" vec=({correction.x:.4f},"
+                            f"{correction.y:.4f},"
+                            f"{correction.z:.4f})\n",
+                            True)
 
                     corr_plc = FreeCAD.Placement(
                         correction, FreeCAD.Rotation())
@@ -6480,7 +7094,6 @@ class PcbObject:
                         # translation, the remaining_plc applied after
                         # loft reconstruction will carry the same
                         # correction back onto the rebuilt wedge.
-                        piece_shapes[pi].translate(correction)
                         piece_plc[pi] = corr_plc.multiply(
                             piece_plc[pi])
 
@@ -6514,19 +7127,88 @@ class PcbObject:
                         child.Placement.Base = \
                             child.Placement.Base + correction
 
-        # Log final positions after all transforms
+        piece_placement_signatures = [
+            _placement_matrix_signature(placement)
+            for placement in piece_plc]
+        reused_rigid_pieces = 0
+        can_reuse_rigid_shapes = (
+            previous_partition_signature == partition_signature
+            and previous_piece_shapes is not None
+            and previous_placement_signatures is not None
+            and len(previous_piece_shapes) == len(piece_shapes)
+            and len(previous_placement_signatures) == len(piece_shapes))
         for pi in range(len(piece_shapes)):
-            s = piece_shapes[pi]
-            if s.isValid() and s.Volume > 1e-6:
-                orig = pieces[pi].CenterOfMass
-                final = s.CenterOfMass
-                dist = orig.distanceToPoint(final)
-                if dist > GEOMETRY_TOLERANCE:
-                    FreeCAD.Console.PrintMessage(
-                        f"FreekiCAD: piece {pi} moved"
-                        f" {dist:.3f}mm to"
-                        f" ({final.x:.2f},{final.y:.2f},"
-                        f"{final.z:.2f})\n")
+            if pi in strip_pieces:
+                # Wedges are rebuilt below. Materialize their final rigid
+                # target once for placement/anchor checks instead of mutating
+                # the source BRep at every micro-bend above.
+                piece_shapes[pi] = pieces[pi].copy()
+                piece_shapes[pi].transformShape(
+                    piece_plc[pi].toMatrix())
+                continue
+            if (can_reuse_rigid_shapes
+                    and pi not in previous_strip_pieces
+                    and previous_placement_signatures[pi]
+                    == piece_placement_signatures[pi]
+                    and previous_piece_shapes[pi] is not None):
+                try:
+                    piece_shapes[pi] = previous_piece_shapes[pi].copy()
+                except Exception:
+                    piece_shapes[pi] = previous_piece_shapes[pi]
+                reused_rigid_pieces += 1
+                continue
+            piece_shapes[pi] = pieces[pi].copy()
+            piece_shapes[pi].transformShape(piece_plc[pi].toMatrix())
+
+        FreeCAD.Console.PrintMessage(
+            f"FreekiCAD: [profile] rigid body pieces: "
+            f"reused={reused_rigid_pieces}, "
+            f"rebuilt={len(piece_shapes) - len(strip_pieces) - reused_rigid_pieces}\n")
+
+        # Retain flat partitions, slices, and final rigid transforms.  They
+        # support both incremental rebending and coupler marker updates.
+        if previous_partition_signature != partition_signature:
+            for cache_name in (
+                    '_bend_cached_piece_shapes',
+                    '_bend_cached_piece_placement_signatures',
+                    '_bend_cached_strip_pieces'):
+                try:
+                    delattr(self, cache_name)
+                except AttributeError:
+                    pass
+        self._bend_partition_signature = partition_signature
+        self._bend_partition_pieces = pieces
+        self._bend_partition_piece_slices = piece_slices
+        self._bend_partition_cut_touching_pieces = [
+            set(touching) for touching in cut_touching_pieces]
+        self._bend_partition_piece_touching_cuts = [
+            set(touching) for touching in piece_touching_cuts]
+        self._bend_partition_strip_pieces = set(strip_pieces)
+        self._bend_partition_half_t = half_t
+        self._bend_child_piece_idx = dict(comp_piece_idx)
+        self._bend_piece_placements = []
+        for placement in piece_plc:
+            try:
+                self._bend_piece_placements.append(placement.copy())
+            except Exception:
+                self._bend_piece_placements.append(placement)
+
+        # Final-position diagnostics require validity, volume, and center-of-
+        # mass queries for every result solid. Keep that OCCT work behind the
+        # existing debug switch instead of slowing normal rebuilds.
+        if wedge_diag:
+            for pi in range(len(piece_shapes)):
+                s = piece_shapes[pi]
+                if s.isValid() and s.Volume > 1e-6:
+                    orig = pieces[pi].CenterOfMass
+                    final = s.CenterOfMass
+                    dist = orig.distanceToPoint(final)
+                    if dist > GEOMETRY_TOLERANCE:
+                        FreeCAD.Console.PrintMessage(
+                            f"FreekiCAD: piece {pi} moved"
+                            f" {dist:.3f}mm to"
+                            f" ({final.x:.2f},{final.y:.2f},"
+                            f"{final.z:.2f})\n")
 
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] Phase 3 (rotation): "
@@ -6551,6 +7233,16 @@ class PcbObject:
         is_wireframe_wedge = (wedge_mode == "Wireframe")
         wedge_target_edge_splits = self._get_wedge_target_edge_splits(
             wedge_mode)
+        wedge_stage_seconds = {}
+        wedge_stage_calls = {}
+        wedge_adaptive_choices = {}
+
+        def _record_wedge_stage(stage, started):
+            elapsed = _time.perf_counter() - started
+            wedge_stage_seconds[stage] = (
+                wedge_stage_seconds.get(stage, 0.0) + elapsed)
+            wedge_stage_calls[stage] = wedge_stage_calls.get(stage, 0) + 1
+            return elapsed
         # N_SLICES per wedge: at least 16, or 1 per degree
         # (computed per wedge below)
         coc_offsets = {}  # bi → (bend_obj, first_s_mi)
@@ -7906,6 +8598,18 @@ class PcbObject:
                     tol_cfg.get('close', GEOMETRY_TOLERANCE))
             point_tol = max(close_tol * 0.5, 1e-7)
             line_tol = max(close_tol * 2.0, point_tol * 2.0)
+            if wedge_ctx is not None:
+                # Non-collinear transformed source vertices prove that the
+                # bent boundary cannot collapse. Only ambiguous collinear
+                # endpoints need the expensive dense edge sampling below.
+                vertex_points = [
+                    _bend_wedge_point(vertex.Point, wedge_ctx)
+                    for vertex in getattr(source_wire, 'Vertexes', [])]
+                if (len(vertex_points) >= 3
+                        and not _points_collapse_to_line(
+                            vertex_points, point_tol,
+                            line_tol=line_tol)):
+                    return False
             bent_pts = []
             for source_edge in getattr(source_wire, 'Edges', []):
                 bent_edge = _lookup_bent_wedge_edge(
@@ -8312,60 +9016,71 @@ class PcbObject:
             if shape is None:
                 return None, None, 0.0
 
-            attempts = [("raw", shape)]
-
-            def _add_attempt(label, candidate):
-                if candidate is not None:
-                    attempts.append((label, candidate))
-
             if fix_tol is None:
                 fix_tol = GEOMETRY_TOLERANCE
             if fix_max_tol is None:
                 fix_max_tol = max(
                     GEOMETRY_TOLERANCE, GEOMETRY_TOLERANCE * 10.0)
 
+            def _accept_valid(label, candidate):
+                if candidate is None:
+                    return None
+                try:
+                    vol = float(candidate.Volume)
+                except Exception:
+                    vol = 0.0
+                if abs(vol) <= 1e-9:
+                    return None
+                if vol < 0:
+                    try:
+                        candidate = candidate.reversed()
+                        vol = abs(float(candidate.Volume))
+                    except Exception:
+                        return None
+                try:
+                    valid = candidate.isValid()
+                except Exception:
+                    valid = True
+                if not valid:
+                    return None
+                return candidate, label, vol
+
+            # Repairs are expensive OCC operations.  Validate each candidate
+            # before constructing the next one so the normal raw-valid wedge
+            # path does not pay for fix/removeSplitter copies that are never
+            # inspected.
+            accepted = _accept_valid("raw", shape)
+            if accepted is not None:
+                return accepted
+
             try:
                 fixed = shape.copy()
                 fixed.fix(fix_tol, fix_tol, fix_max_tol)
-                _add_attempt("fix", fixed)
             except Exception:
-                pass
+                fixed = None
+            accepted = _accept_valid("fix", fixed)
+            if accepted is not None:
+                return accepted
 
             try:
                 split = shape.copy().removeSplitter()
-                _add_attempt("removeSplitter", split)
             except Exception:
-                pass
+                split = None
+            accepted = _accept_valid("removeSplitter", split)
+            if accepted is not None:
+                return accepted
 
             try:
                 fixed_split = shape.copy()
                 fixed_split.fix(fix_tol, fix_tol, fix_max_tol)
                 fixed_split = fixed_split.removeSplitter()
                 fixed_split.fix(fix_tol, fix_tol, fix_max_tol)
-                _add_attempt("fix+removeSplitter+fix", fixed_split)
             except Exception:
-                pass
-
-            for label, candidate in attempts:
-                try:
-                    vol = float(candidate.Volume)
-                except Exception:
-                    vol = 0.0
-                if abs(vol) <= 1e-9:
-                    continue
-                if vol < 0:
-                    try:
-                        candidate = candidate.reversed()
-                        vol = abs(float(candidate.Volume))
-                    except Exception:
-                        continue
-                try:
-                    valid = candidate.isValid()
-                except Exception:
-                    valid = True
-                if not valid:
-                    continue
-                return candidate, label, vol
+                fixed_split = None
+            accepted = _accept_valid(
+                "fix+removeSplitter+fix", fixed_split)
+            if accepted is not None:
+                return accepted
             return None, None, 0.0
 
         def _orient_face_outward(face, solid_center):
@@ -8502,18 +9217,23 @@ class PcbObject:
             def _build_shell_candidates(
                     candidate_faces,
                     candidate_fix_tol,
-                    candidate_fix_max_tol):
+                    candidate_fix_max_tol,
+                    primary_only=False,
+                    include_primary=True):
                 shell_candidates = []
 
                 def _add_shell_candidate(label, shape):
                     for shell in _collect_shape_shells(shape):
                         shell_candidates.append((label, shell))
 
-                try:
-                    _add_shell_candidate(
-                        "makeShell", Part.makeShell(candidate_faces))
-                except Exception:
-                    pass
+                if include_primary:
+                    try:
+                        _add_shell_candidate(
+                            "makeShell", Part.makeShell(candidate_faces))
+                    except Exception:
+                        pass
+                if primary_only:
+                    return shell_candidates
                 try:
                     _add_shell_candidate(
                         "Shell", Part.Shell(candidate_faces))
@@ -8667,8 +9387,21 @@ class PcbObject:
 
                 return best
 
+            # Most source-topology wedges already form one valid shell.  Try
+            # that normal result before constructing duplicate Shell,
+            # compound, sew, and fix candidates.  Those fallbacks are much
+            # more expensive and are needed only for imperfect topology.
             shell_candidates = _build_shell_candidates(
-                unique_faces, fix_tol, fix_max_tol)
+                unique_faces, fix_tol, fix_max_tol,
+                primary_only=True)
+            solid = _try_shell_candidates(
+                shell_candidates, target_vol, fix_tol, fix_max_tol)
+            if solid is not None:
+                return solid
+
+            shell_candidates = _build_shell_candidates(
+                unique_faces, fix_tol, fix_max_tol,
+                include_primary=False)
             solid = _try_shell_candidates(
                 shell_candidates, target_vol, fix_tol, fix_max_tol)
             if solid is not None:
@@ -8823,10 +9556,12 @@ class PcbObject:
                 )
 
             def _try_source_topology():
+                rebuild_started = _time.perf_counter()
                 (rebuilt_faces,
                  tri_fallback_faces,
                  collapsed_faces,
                  dropped_faces) = _build_rebuilt_faces()
+                _record_wedge_stage("face-rebuild", rebuild_started)
                 if not rebuilt_faces:
                     return None
                 if wedge_diag:
@@ -8836,8 +9571,10 @@ class PcbObject:
                         f" tri_fallback={tri_fallback_faces}"
                         f" collapsed={collapsed_faces}"
                         f" dropped={dropped_faces}\n")
+                solidify_started = _time.perf_counter()
                 solid = _solidify_surface_faces(
                     rebuilt_faces, wedge_ctx, "source-topology")
+                _record_wedge_stage("solidify", solidify_started)
                 if solid is None:
                     return None
                 target_vol = abs(float(
@@ -8909,11 +9646,13 @@ class PcbObject:
             tol_cfg = wedge_ctx.get('tolerances') or {}
             weld_tol = float(
                 tol_cfg.get('weld', max(1e-6, GEOMETRY_TOLERANCE * 0.1)))
+            edge_started = _time.perf_counter()
             bent_pairs = _build_bent_wedge_edges(
                 source_edges, wedge_ctx,
                 vertex_cache=welded_vertex_cache,
                 welded_points=welded_points,
                 weld_tol=weld_tol)
+            _record_wedge_stage("bent-edges", edge_started)
             if not bent_pairs:
                 return None
 
@@ -9235,6 +9974,7 @@ class PcbObject:
         wedge_output_placements = {}
         for pi in sorted(strip_to_bend):
             _t_loft_one = _time.time()
+            wedge_loop_started = _time.perf_counter()
             bi = strip_to_bend[pi]
             _, p0_bi, p1_bi, line_dir_bi, normal_bi, \
                 angle_rad_bi, radius_bi = bend_info[bi]
@@ -9250,6 +9990,14 @@ class PcbObject:
             s_mi = strip_to_mi.get(pi)
             if s_mi is None:
                 continue
+            wedge_chain = piece_mi_list[pi]
+            try:
+                wedge_mi_pos = wedge_chain.index(s_mi)
+            except ValueError:
+                wedge_mi_pos = -1
+            own_correction_only = (
+                wedge_mi_pos >= 0
+                and wedge_mi_pos == len(wedge_chain) - 1)
             wedge_stationary_pi = mi_to_stationary_pi.get(s_mi)
             micro_angle_s = micro_bend_info[s_mi][0]
 
@@ -9295,16 +10043,8 @@ class PcbObject:
                     joint_dbg = joints[sid_dbg]
                     seg_p0_dbg, seg_p1_dbg = joint_dbg['center']
                     metrics_dbg = _piece_segment_debug_metrics(
-                        pieces[pi], seg_p0_dbg, seg_p1_dbg)
-                    touch_faces_dbg = []
-                    for fi_dbg in range(len(cut_faces)):
-                        try:
-                            d_touch_dbg = piece_slices[pi].distToShape(
-                                cut_segments[fi_dbg])[0]
-                        except Exception:
-                            d_touch_dbg = float('inf')
-                        if d_touch_dbg < GEOMETRY_TOLERANCE:
-                            touch_faces_dbg.append(fi_dbg)
+                        pi, seg_p0_dbg, seg_p1_dbg)
+                    touch_faces_dbg = sorted(piece_touching_cuts[pi])
                     touch_sids_dbg = sorted(set(
                         face_to_seg[fi_dbg]
                         for fi_dbg in touch_faces_dbg
@@ -9466,9 +10206,17 @@ class PcbObject:
                 anchor_ref_far=anchor_ref_far,
                 anchor_target_near=anchor_target_near,
                 anchor_target_far=anchor_target_far)
+            profile_started = _time.perf_counter()
             wedge_ctx['profile'] = _extract_flat_wedge_profile(
                 wedge_ctx)
+            _record_wedge_stage("profile", profile_started)
 
+            # The smooth wedge builder below deforms the source topology
+            # directly; it does not consume the legacy cross-section slices.
+            # Keep those slices only for BuildDebugObjects diagnostics.  OCC
+            # slice() calls are comparatively expensive, especially on an FPC
+            # with many wedge pieces, so doing them during every normal build
+            # added avoidable fresh-bend time without affecting the result.
             # Build uniform d-values over the wedge's actual projected span.
             d_uniform = []
             for si in range(N_SLICES + 1):
@@ -9485,7 +10233,7 @@ class PcbObject:
             all_wires_flat = []  # for debug logging
             attempted_ds = []
             split_ds = []
-            if not is_wireframe_wedge:
+            if wedge_diag and not is_wireframe_wedge:
                 # Split the d-range at vertex projection planes
                 # so each sub-range has consistent cross-section
                 # topology.  We slice the original solid for each
@@ -9646,7 +10394,9 @@ class PcbObject:
                     f"FreekiCAD:   slices={len(all_wires_flat)}"
                     f" edges={wire_edges}\n")
 
-            if not is_wireframe_wedge and not all_wires_flat:
+            if (wedge_diag
+                    and not is_wireframe_wedge
+                    and not all_wires_flat):
                 bbox = positioned_flat.BoundBox
                 attempted_ds = sorted(set(attempted_ds))
                 attempted_side_counts = []
@@ -9724,22 +10474,34 @@ class PcbObject:
                     return _build_wedge_wireframe_analytic(ctx)
                 return _build_wedge_wireframe_analytic(ctx)
 
+            shape_started = _time.perf_counter()
             loft = _build_wedge_shape(wedge_mode, wedge_ctx)
+            _record_wedge_stage("shape-build", shape_started)
 
+            placement_started = _time.perf_counter()
             if loft is not None:
-                    loft_pre_cm = _shape_center(loft)
+                    placement_prep_started = _time.perf_counter()
+                    # Normal smooth wedges do not need their center for
+                    # placement; compute it only for diagnostics or the
+                    # wireframe translation fallback.
+                    loft_pre_cm = (
+                        _shape_center(loft) if wedge_diag else None)
                     remaining_plc = None
                     applied_plc = FreeCAD.Placement()
                     remaining_axis = FreeCAD.Vector() if wedge_diag else None
                     target_cm_pre = FreeCAD.Vector(target_cm)
                     target_near_ref = FreeCAD.Vector(near_ref)
                     target_far_ref = FreeCAD.Vector(far_ref)
+                    _record_wedge_stage(
+                        "placement-prep", placement_prep_started)
                     # Apply remaining Phase 3
                     # rotations: the loft was built
                     # in the pre-mi frame; use the
                     # wedge's own absolute chain to
                     # catch subsequent rotations.
                     if pi in wedge_post_mi_plc:
+                        placement_remaining_started = \
+                            _time.perf_counter()
                         remaining_plc = piece_plc[
                             pi].multiply(
                             wedge_post_mi_plc[
@@ -9765,6 +10527,9 @@ class PcbObject:
                             target_far_ref = FreeCAD.Vector(far_ref)
                         ra = remaining_plc.Rotation.Angle
                         rb = remaining_plc.Base.Length
+                        _record_wedge_stage(
+                            "placement-remaining",
+                            placement_remaining_started)
                         if wedge_diag:
                             loft_anchor_near_pre = _closest_point_on_shape(
                                 loft, near_ref)
@@ -9808,24 +10573,83 @@ class PcbObject:
                         applied_plc = remaining_plc
                         applied_frac = 1.0
                         if ra <= 1e-6 and rb > 1e-6:
+                            placement_adaptive_started = \
+                                _time.perf_counter()
+                            # When the wedge's own bend is the last item in
+                            # its transform chain, the remaining translation
+                            # is only that bend's inset correction.  The
+                            # analytic curved rebuild already spans the
+                            # corrected moving edge, so applying the rigid
+                            # correction again would double it.  Select the
+                            # known zero placement without expensive BRep
+                            # distance checks.  Keep adaptive scoring when a
+                            # later bend could have composed into a net
+                            # translation.
+                            if own_correction_only:
+                                applied_plc = FreeCAD.Placement()
+                                applied_frac = 0.0
+                                wedge_adaptive_choices[0.0] = (
+                                    wedge_adaptive_choices.get(0.0, 0) + 1)
+                                if wedge_diag:
+                                    FreeCAD.Console.PrintMessage(
+                                        f"FreekiCAD: wedge pi={pi}"
+                                        f" correction-only translation"
+                                        f" choose=0.00\n")
+                                _record_wedge_stage(
+                                    "placement-adaptive",
+                                    placement_adaptive_started)
+                                placement_adaptive_started = None
                             neighbor_shapes = []
-                            for nbr, _bi, _fi in adjacency[pi]:
-                                if nbr in strip_pieces:
-                                    continue
-                                if nbr < 0 or nbr >= len(piece_shapes):
-                                    continue
-                                neighbor_shapes.append(
-                                    (nbr, piece_shapes[nbr]))
-                            if neighbor_shapes:
-                                target_anchor_near = _closest_point_on_shape(
-                                    target_shape, target_near_ref)
-                                target_anchor_far = _closest_point_on_shape(
-                                    target_shape, target_far_ref)
+                            if not own_correction_only:
+                                for nbr, _bi, _fi in adjacency[pi]:
+                                    if nbr in strip_pieces:
+                                        continue
+                                    if nbr < 0 or nbr >= len(piece_shapes):
+                                        continue
+                                    neighbor_shapes.append(
+                                        (nbr, piece_shapes[nbr]))
+                            if not own_correction_only and neighbor_shapes:
                                 best_score = None
                                 best_plc = None
                                 best_frac = 1.0
                                 adaptive_scores = []
-                                for frac in (0.0, 0.5, 1.0):
+                                adaptive_distance_tolerance = 1e-6
+                                # The rebuilt wedge is normally already
+                                # touching every adjacent rigid piece.  Since
+                                # adjacency distance cannot improve below
+                                # zero, accept that position immediately and
+                                # avoid two transformed copies plus the
+                                # center/anchor distance queries.  Keep the
+                                # full legacy scoring for non-exact cases.
+                                zero_dists = []
+                                for _nbr, nbr_shape in neighbor_shapes:
+                                    zero_d = _shape_distance(loft, nbr_shape)
+                                    if not math.isnan(zero_d):
+                                        zero_dists.append(zero_d)
+                                zero_is_exact = (
+                                    bool(zero_dists)
+                                    and max(zero_dists)
+                                    <= adaptive_distance_tolerance)
+                                if zero_is_exact:
+                                    best_score = (
+                                        float(max(zero_dists)),
+                                        float(sum(zero_dists)),
+                                        0.0, 0.0, 0.0)
+                                    best_plc = FreeCAD.Placement()
+                                    best_frac = 0.0
+                                    candidate_fracs = ()
+                                    if wedge_diag:
+                                        adaptive_scores.append(
+                                            "0.00:exact-adjacency")
+                                else:
+                                    target_anchor_near = \
+                                        _closest_point_on_shape(
+                                            target_shape, target_near_ref)
+                                    target_anchor_far = \
+                                        _closest_point_on_shape(
+                                            target_shape, target_far_ref)
+                                    candidate_fracs = (0.0, 0.5, 1.0)
+                                for frac in candidate_fracs:
                                     cand_plc = FreeCAD.Placement()
                                     cand_plc.Base = FreeCAD.Vector(
                                         remaining_plc.Base.x * frac,
@@ -9889,7 +10713,9 @@ class PcbObject:
                                         # ties so the center match can decide.
                                         for axis, (cand_v, best_v) in enumerate(
                                                 zip(cand_score, best_score)):
-                                            tol = 1e-6 if axis < 4 else 1e-9
+                                            tol = (
+                                                adaptive_distance_tolerance
+                                                if axis < 4 else 1e-9)
                                             if cand_v < best_v - tol:
                                                 better = True
                                                 break
@@ -9902,6 +10728,9 @@ class PcbObject:
                                 if best_plc is not None:
                                     applied_plc = best_plc
                                     applied_frac = best_frac
+                                    wedge_adaptive_choices[best_frac] = (
+                                        wedge_adaptive_choices.get(
+                                            best_frac, 0) + 1)
                                     if wedge_diag:
                                         FreeCAD.Console.PrintMessage(
                                             f"FreekiCAD: wedge pi={pi}"
@@ -9910,13 +10739,16 @@ class PcbObject:
                                             f" scores=["
                                             f"{'; '.join(adaptive_scores)}"
                                             f"]\n")
-                            elif is_wireframe_wedge:
+                            elif (not own_correction_only
+                                  and is_wireframe_wedge):
                                 base = remaining_plc.Base
                                 base_len2 = (
                                     base.x * base.x
                                     + base.y * base.y
                                     + base.z * base.z)
                                 if base_len2 > 1e-18:
+                                    if loft_pre_cm is None:
+                                        loft_pre_cm = _shape_center(loft)
                                     center_delta = target_cm - loft_pre_cm
                                     proj_frac = center_delta.dot(base) / base_len2
                                     proj_frac = max(0.0, min(1.0, proj_frac))
@@ -9934,6 +10766,10 @@ class PcbObject:
                                             f" center_delta={_fmt_vec(center_delta)}"
                                             f" base={_fmt_vec(base)}"
                                             f" fallback=no-neighbors\n")
+                            if placement_adaptive_started is not None:
+                                _record_wedge_stage(
+                                    "placement-adaptive",
+                                    placement_adaptive_started)
                         if (ra > 1e-6
                                 or applied_plc.Base.Length > 1e-6):
                             if ra <= 1e-6 and abs(applied_frac - 1.0) > 1e-9:
@@ -9943,8 +10779,12 @@ class PcbObject:
                                         f" applying adaptive translation"
                                         f" base={_fmt_vec(applied_plc.Base)}"
                                         f" frac={applied_frac:.2f}\n")
-                            loft.transformShape(
-                                applied_plc.toMatrix())
+                            placement_transform_started = \
+                                _time.perf_counter()
+                            loft.transformShape(applied_plc.toMatrix())
+                            _record_wedge_stage(
+                                "placement-transform",
+                                placement_transform_started)
                     else:
                         if wedge_diag:
                             loft_anchor_near_pre = _closest_point_on_shape(
@@ -10065,6 +10905,8 @@ class PcbObject:
                             f" adjacent=["
                             f"{', '.join(adjacent_bridge) if adjacent_bridge else '-'}"
                             f"]\n")
+            _record_wedge_stage("placement", placement_started)
+            _record_wedge_stage("total", wedge_loop_started)
             if wedge_diag:
                 FreeCAD.Console.PrintMessage(
                     f"FreekiCAD: [profile] wedge p{pi}"
@@ -10073,6 +10915,17 @@ class PcbObject:
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] Wedge build: "
             f"{_time.time() - _t_loft:.3f}s\n")
+        if wedge_stage_seconds:
+            stage_summary = ", ".join(
+                f"{stage}={seconds:.3f}s/{wedge_stage_calls[stage]}"
+                for stage, seconds in wedge_stage_seconds.items())
+            FreeCAD.Console.PrintMessage(
+                f"FreekiCAD: [profile] Wedge stages: "
+                f"{stage_summary}\n")
+        if wedge_adaptive_choices:
+            FreeCAD.Console.PrintMessage(
+                "FreekiCAD: [profile] Wedge adaptive choices: "
+                f"{sorted(wedge_adaptive_choices.items())}\n")
 
         bend_plc_debug = {}
         for child in obj.Group:
@@ -10099,12 +10952,13 @@ class PcbObject:
                 final_center = (final_p0 + final_p1) * 0.5
             else:
                 final_center = final_plc.Base
-            FreeCAD.Console.PrintMessage(
+            _log_bending_bfs(
                 f"FreekiCAD: bendline {bl_obj.Name} (mi={first_mi})"
                 f" center=({final_center.x:.2f},{final_center.y:.2f},"
                 f"{final_center.z:.2f})"
                 f" off=({visual_off.x:.3f},{visual_off.y:.3f},"
-                f"{visual_off.z:.3f})\n")
+                f"{visual_off.z:.3f})\n",
+                wedge_diag)
 
         # Draw debug visualizations if enabled
         show_debug = getattr(obj, 'BuildDebugObjects', False)
@@ -10517,6 +11371,16 @@ class PcbObject:
                 _repair_piece_shape_for_display(s, pi)
                 for pi, s in enumerate(piece_shapes)
             ]
+            self._bend_cached_piece_shapes = []
+            for shape in piece_shapes:
+                try:
+                    self._bend_cached_piece_shapes.append(
+                        shape.copy() if shape is not None else None)
+                except Exception:
+                    self._bend_cached_piece_shapes.append(shape)
+            self._bend_cached_piece_placement_signatures = list(
+                piece_placement_signatures)
+            self._bend_cached_strip_pieces = set(strip_pieces)
             board_obj.Shape = Part.makeCompound(
                 [s for s in piece_shapes if _shape_should_display(s)])
 
@@ -10858,7 +11722,8 @@ class PcbObject:
         except Exception:
             pass
 
-    def _trim_line_to_outline(self, p0, p1, board_face):
+    def _trim_line_to_outline(
+            self, p0, p1, board_face, linear_outline=None):
         """Trim a 2D line to the board face using BRep section.
 
         Uses FreeCAD's geometry kernel to compute exact intersection
@@ -10875,6 +11740,12 @@ class PcbObject:
 
         if board_face is None:
             return []
+
+        if linear_outline is not None:
+            clipped = _clip_segment_to_linear_outline(
+                p0, p1, linear_outline)
+            if clipped is not None:
+                return clipped
 
         # Create an edge from p0 to p1 at z=0
         edge = Part.makeLine(
@@ -11132,7 +12003,8 @@ class PcbObject:
 
     def _build_geometric_adjacency(self, pieces, cut_faces, cut_plan,
                                     piece_slices=None, cut_segments=None,
-                                    joints=None, face_to_seg=None):
+                                    joints=None, face_to_seg=None,
+                                    cut_touching_pieces=None):
         """Build geometric adjacency: which pieces touch and via which cut face.
 
         Returns a list of (i, j, fi) tuples.
@@ -11143,41 +12015,49 @@ class PcbObject:
         generalFuse splits do not disconnect the BFS tree.
 
         When *piece_slices* and *cut_segments* are provided, uses 2D
-        geometry for distance checks instead of 3D solids.
+        geometry for distance checks instead of 3D solids.  A precomputed
+        *cut_touching_pieces* incidence map bypasses those checks entirely.
         """
-        n = len(pieces)
-        tol = GEOMETRY_TOLERANCE
-        shapes = piece_slices if piece_slices is not None else pieces
-
         # Group-based adjacency: for each cut face, find all
         # touching pieces; adjacent pairs share the face.
-        face_pieces = {}  # fi → set of pi
-        matched_faces = set(face_to_seg) if face_to_seg is not None else set()
-        if joints is not None:
-            for grp in joints:
-                for fi in grp['a_faces'] + grp['b_faces']:
-                    cf_shape = (cut_segments[fi]
-                                if cut_segments is not None
-                                else cut_faces[fi])
-                    adj = set()
-                    for pi in range(n):
-                        if shapes[pi].distToShape(cf_shape)[0] < tol:
-                            adj.add(pi)
-                    face_pieces[fi] = adj
-                    matched_faces.add(fi)
+        if cut_touching_pieces is not None:
+            face_pieces = {
+                fi: set(touching)
+                for fi, touching in enumerate(cut_touching_pieces)
+                if len(touching) >= 2
+            }
+        else:
+            n = len(pieces)
+            tol = GEOMETRY_TOLERANCE
+            shapes = piece_slices if piece_slices is not None else pieces
+            face_pieces = {}  # fi → set of pi
+            matched_faces = set(face_to_seg) \
+                if face_to_seg is not None else set()
+            if joints is not None:
+                for grp in joints:
+                    for fi in grp['a_faces'] + grp['b_faces']:
+                        cf_shape = (cut_segments[fi]
+                                    if cut_segments is not None
+                                    else cut_faces[fi])
+                        adj = set()
+                        for pi in range(n):
+                            if shapes[pi].distToShape(cf_shape)[0] < tol:
+                                adj.add(pi)
+                        face_pieces[fi] = adj
+                        matched_faces.add(fi)
 
-        for fi in range(len(cut_faces)):
-            if fi in matched_faces:
-                continue
-            cf_shape = (cut_segments[fi]
-                        if cut_segments is not None
-                        else cut_faces[fi])
-            adj = set()
-            for pi in range(n):
-                if shapes[pi].distToShape(cf_shape)[0] < tol:
-                    adj.add(pi)
-            if len(adj) >= 2:
-                face_pieces[fi] = adj
+            for fi in range(len(cut_faces)):
+                if fi in matched_faces:
+                    continue
+                cf_shape = (cut_segments[fi]
+                            if cut_segments is not None
+                            else cut_faces[fi])
+                adj = set()
+                for pi in range(n):
+                    if shapes[pi].distToShape(cf_shape)[0] < tol:
+                        adj.add(pi)
+                if len(adj) >= 2:
+                    face_pieces[fi] = adj
         # Build crossings: pairs of pieces that share a cut face.
         #
         # Do not pre-filter by center-of-mass side here. Wedge/rigid
@@ -11202,7 +12082,7 @@ class PcbObject:
 
     def _classify_pieces_bfs(self, pieces, cut_faces, face_to_bend,
                              mass_center, half_t, bend_info, cut_plan,
-                             micro_bend_info=None, log=True,
+                             micro_bend_info=None, log=False,
                              mi_seg_idx=None,
                              cached_geo_crossings=None,
                              piece_slices=None, cut_segments=None,
@@ -11281,7 +12161,8 @@ class PcbObject:
                 if crossings:
                     _log_bending_bfs(
                         f"FreekiCAD: adjacent {pi} → "
-                        f"{', '.join(crossings)}\n")
+                        f"{', '.join(crossings)}\n",
+                        log)
 
         # BFS: strict first-visit, all crossings add the bend.
         # No re-visiting, no re-queuing — first path wins.
@@ -11371,9 +12252,9 @@ class PcbObject:
             win first-visit BFS over a real cross-bend traversal.
             """
             ordered = []
-            for nbr2, bi2, fi2 in adjacency[wedge_pi]:
-                if nbr2 == src_pi:
-                    continue
+            destinations = _rigid_wedge_destinations(
+                adjacency[wedge_pi], src_pi, _sp)
+            for nbr2, bi2, fi2 in destinations:
                 ordered.append((
                     0 if _side_test(src_pi, nbr2, entry_fi) else 1,
                     nbr2,
@@ -11416,7 +12297,8 @@ class PcbObject:
                                 f"FreekiCAD: BFS p{cur} → "
                                 f"wedge p{nbr} "
                                 f"(entry={_crossing_label(bi)})"
-                                f"\n")
+                                f"\n",
+                                log)
                         for nbr2, bi2, fi2 in _ordered_wedge_neighbors(
                                 cur, nbr, fi):
                             if piece_bend_sets[nbr2] is not None:
@@ -11438,7 +12320,8 @@ class PcbObject:
                                         f"fi={fi}) "
                                         f"(entry="
                                         f"{_crossing_label(bi)}"
-                                        f")\n")
+                                        f")\n",
+                                        log)
                                 queue.append(nbr2)
                                 continue
                             bend_idx2 = _get_bend_idx(bi2)
@@ -11464,7 +12347,8 @@ class PcbObject:
                                     f"p{cur} →[{_crossing_label(bi)}"
                                     f"]→ p{nbr}(W) →["
                                     f"{_crossing_label(sbi2)}]→ "
-                                    f"p{nbr2}\n")
+                                    f"p{nbr2}\n",
+                                    log)
                             queue.append(nbr2)
                     else:
                         # Regular piece (no wedge) — positive mi.
@@ -11478,7 +12362,8 @@ class PcbObject:
                                     f"p{cur}, p{nbr}, "
                                     f"fi={fi}) FAIL "
                                     f"(cut="
-                                    f"{_crossing_label(bi)})\n")
+                                    f"{_crossing_label(bi)})\n",
+                                    log)
                             continue
                         piece_bend_sets[nbr] = \
                             piece_bend_sets[cur] | (
@@ -11489,7 +12374,8 @@ class PcbObject:
                             _log_bending_bfs(
                                 f"FreekiCAD: BFS p{cur} →"
                                 f"[{_crossing_label(bi)}]→ "
-                                f"p{nbr}\n")
+                                f"p{nbr}\n",
+                                log)
                         queue.append(nbr)
 
         else:
@@ -11535,17 +12421,19 @@ class PcbObject:
                     f" parent={parent}"
                     f" mis_crossed=[{labels}]"
                     f" raw={raw}"
-                    f" wedge={wedge_pi}\n")
+                    f" wedge={wedge_pi}\n",
+                    log)
 
         classified_count = sum(
             1 for bends in piece_bend_sets if bends is not None)
         crossed_count = sum(
             1 for bends in piece_bend_sets if bends)
-        FreeCAD.Console.PrintMessage(
+        _log_bending_bfs(
             f"FreekiCAD: BFS summary"
             f" classified={classified_count}/{n}"
             f" crossed={crossed_count}/{n}"
-            f" root={stationary_idx}\n")
+            f" root={stationary_idx}\n",
+            log)
 
         return piece_bend_sets, bfs_tree, adjacency, cached_geo_crossings
 

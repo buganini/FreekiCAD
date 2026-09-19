@@ -96,6 +96,55 @@ containing its flat centroid. Before deformation, its flat area is intersected
 with every active bend span; each non-trivial overlap emits a warning because
 the stiffener itself is not curved through the bend.
 
+## Incremental Rebending
+
+The runtime cache identifies a flat partition layout by board thickness and
+the ordered, trimmed A/B cut segments. When this signature is unchanged, a
+subsequent rebend reuses the existing flat body pieces and their 2D slices,
+skipping `generalFuse` and slice reconstruction. A source-board reload, an
+inactive bending state, or conflicting bend spans invalidates the cache.
+
+During Phase 3, every piece accumulates only a `piece_plc`; its BRep is not
+transformed repeatedly at every bend step. A wedge's pre-bend snapshot and
+final rigid target are each materialized once from its cached flat partition
+and the placement accumulated at that point. After all transforms and inset
+corrections are known, a rigid piece's final placement matrix is compared with
+the prior run. An unchanged rigid piece reuses its previous bent shape, while a
+changed piece is copied from its cached flat partition and transformed once.
+Curved wedge pieces are always rebuilt because their geometry depends on bend
+sweep and radius even when a neighboring rigid transform is unchanged.
+Display-layer fragments are currently rebuilt from their flat profiles.
+
+### Performance Regression Baseline
+
+The cached `main` comparison baseline was built from commit
+`76c86d2232bfd117c82c70314e5d0e01fa94a274`. Its unit-test results and
+benchmarks for `maze_radius.kicad_pcb`, `maze_radius_fan.kicad_pcb`,
+`maze_radius_skewed.kicad_pcb`, `fpc.kicad_pcb`, and `fpc2.kicad_pcb` may be
+reused until the `main` commit changes; rebuild the baseline after it changes.
+
+## Coupler Pose Updates
+
+Each coupler marker keeps its flat-board pose in
+`FreekiCAD_InitPlacement`, while its displayed `Placement` includes the bend
+transform of the board partition containing the marker. Coupler-linked PCB
+objects are positioned from that displayed marker pose.
+
+The bending pipeline caches the flat partition solids, each marker's partition
+index, and the final rigid transform of every partition. A FreeCAD property
+edit or live KiCad monitor update therefore never needs to rebuild the bent
+board. Z, Offset, Tilt, rotation, and other non-XY changes reuse the current
+partition transform. For an X/Y change, a cheap point-in-solid lookup on the
+cached flat partitions selects the destination partition, whose cached
+transform is then applied to the new flat marker pose. This also handles a
+marker crossing from one partition to another without rebending the body.
+
+These caches are runtime-only. Until an older restored document has recomputed
+the board and populated them, non-XY edits can recover the current transform as
+`displayed * old_flat.inverse()`; an XY edit conservatively falls back to one
+full rebend. Local marker edits are written back to KiCad independently of how
+the displayed transform is obtained.
+
 ---
 
 ## Constants
@@ -129,6 +178,12 @@ For each bend, creates cut line segments offset from the center line by +/- inse
 2. Offset each segment by -inset (A-side) and +inset (B-side)
 3. Trim offset lines to board outline independently
 
+Straight-edged simple outlines are cached as 2D boundary segments and clipped
+with line intersections plus an even/odd interior test. Curved, degenerate, or
+self-intersecting outlines retain the exact OCC BRep path. An individual cut
+that overlaps an outline edge also falls back to OCC because a point-in-polygon
+test cannot reproduce the kernel's coincident-boundary intervals reliably.
+
 ### Output
 
 - `cut_plan[]` = (sp0, sp1, side, bi, angle_rad, radius, p0, normal, bend_obj, moving_normal)
@@ -136,9 +191,12 @@ For each bend, creates cut line segments offset from the center line by +/- inse
   - Stationary/moving role is determined later by BFS chain selection
   - One entry per cut segment
 
-### Phase 2b-1: Create 3D Cutting Faces
+### Phase 2b-1: Create Partition Tools
 
-Extrudes each 2D cut segment into a vertical rectangular face spanning the full board height. Initially labels all faces with their parent bend index.
+Creates a mid-plane edge and topology metadata for every 2D cut segment. The
+edges drive the normal 2D partition path. Index-compatible vertical rectangular
+faces are constructed lazily only if a 2D distance query or the complete
+partition requires the 3D compatibility fallback.
 
 ### Output
 
@@ -150,24 +208,44 @@ Extrudes each 2D cut segment into a vertical rectangular face spanning the full 
 
 ### Phase 2c: Cut Board and Build Topology
 
-1. `generalFuse(board, cut_faces)` -> compound solid
-2. Extract `pieces` (solids with volume > 1e-6)
-3. Create `piece_slices` (2D wire at z=half_t) and `cut_segments` (2D edge at z=half_t) for fast distance checks
-4. Build `joints` from trimmed center segments:
+1. Slice the unbent board at `z=half_t` to recover its planar body profile,
+   including outline cutouts and drill holes.
+2. Split that face with the cut edges using `BOPTools.SplitAPI.slice`.
+3. Validate total area, extrude each partition face across the board body's
+   actual Z range, and validate the resulting total volume. The area and
+   volume conservation checks catch missing fragments, duplicate fragments,
+   and positive-area overlaps before they become body pieces. They use a
+   `1e-6` relative tolerance to accommodate accumulated OCCT split error while
+   retaining the safety check. This avoids a 3D solid/face boolean on the
+   normal path.
+4. If the planar topology is invalid or validation fails, fall back to
+   `generalFuse(board, cut_faces)` and extract its solids.
+5. Reuse each partition face's boundary wires as `piece_slices` at z=half_t
+   for fast distance checks. The 3D fallback alone slices the resulting solids
+   because it has no retained planar partition faces.
+6. Compute the piece/cut incidence matrix once. Bounding boxes reject distant
+   pairs before the remaining candidates use 2D `distToShape`. Both
+   `cut_touching_pieces[fi]` and `piece_touching_cuts[pi]` are retained.
+7. Build `joints` from trimmed center segments:
    - each joint corresponds to one trimmed center segment (`sid`)
    - A/B faces are assigned to the joint by midpoint projection onto that center segment
    - wedge pieces are assigned by center-of-mass distance to the center segment
-5. Build adjacency graph from joints (see below)
-6. Compute `cut_owner_piece` for debug cut visualization
-7. Run a preliminary non-wedge BFS to determine `fi_parent` / stationary-side ownership for each crossing face
+   - each flat piece's center and bounding box are read from OCCT once; a
+     conservative segment-band box test rejects distant pieces before their
+     vertices are loaded lazily and reused by the remaining 2D tests
+8. Build adjacency graph from the incidence matrix (see below)
+9. Compute `cut_owner_piece` for debug cut visualization from the same matrix
+10. Run a preliminary non-wedge BFS to determine `fi_parent` / stationary-side ownership for each crossing face
 
 ### Adjacency Graph Construction
 
 Produces `(i, j, fi)` crossings from the joint structure:
 
-1. For each cut face `fi` in every joint, find all pieces within `GEOMETRY_TOLERANCE` using 2D `distToShape` → `face_pieces[fi]`
-2. For each pair of pieces touching the same face, apply a **side test**: compute cross-product signed distance of each piece's center of mass relative to the cut segment line. Only connect pieces on opposite sides (`ci * cj < 0`)
-3. Emit deduplicated `(i, j, fi)` crossings
+1. Reuse `cut_touching_pieces[fi]` as `face_pieces[fi]`; no additional
+   distance query is performed.
+2. Emit deduplicated `(i, j, fi)` crossings for pairs touching the same face.
+3. During BFS, apply the local side test against the corresponding bend center
+   segment to reject same-side branch hops.
 
 The **side test** is the key filter — it prevents connecting two pieces that both touch the same face but are on the same side of it rather than separated by it.
 
@@ -189,6 +267,10 @@ After the preliminary parent search:
 
 - Uses positive mi labels from `face_to_micro`
 - **Wedge pass-through**: when BFS hits a wedge piece, it records the positive entry mi on the wedge, then traverses through the wedge to candidate non-wedge neighbors; the exit side is recorded as a synthesized negative crossing `-(mi + 2)`
+  - Adjacent wedge pieces are not treated as pass-through destinations. Each
+    wedge must receive its own canonical entry crossing; otherwise first-visit
+    BFS can attach it to a neighboring wedge as a same-side rigid leaf and
+    leave its bend chain empty.
 - BFS is strict first-visit: first path wins, no revisiting / re-queuing
 - Wedges are special:
   - the wedge itself gets a BFS entry when first reached
@@ -226,6 +308,13 @@ After the preliminary parent search:
 
 ## Phase 3: Apply Bends Sequentially
 
+Rigid-piece transforms are accumulated as placements without copying or
+mutating the flat partition solids. Each result solid is copied only when its
+final transform is materialized; unchanged results may instead reuse the
+previous rebend cache. Per-piece validity, volume, and final-position
+diagnostics, along with BFS paths and micro-bend transforms, run only when
+`BuildDebugObjects` is enabled.
+
 Iterates chain positions; at each position collects distinct mi's across all pieces and processes each. For each `(step_pos, mi)`:
 
 1. Find the stationary/source piece for this specific positive-mi crossing via `mi_to_stationary_pi`
@@ -238,12 +327,13 @@ Iterates chain positions; at each position collects distinct mi's across all pie
    - `bend_sign = -1 if angle > 0 else 1`
    - `pivot = stat_edge_mid + cur_up * (r_eff * bend_sign)`
 5. **(First occurrence of mi only)** Save pivot data in `micro_pivots[mi]` for wedge loft
-6. **(First occurrence of mi only)** Save `wedge_pre_shapes[wpi]` for wedges whose canonical `strip_to_mi[wpi] == mi`
+6. **(First occurrence of mi only)** Materialize `wedge_pre_shapes[wpi]` once from the cached flat wedge and its current `piece_plc` for wedges whose canonical `strip_to_mi[wpi] == mi`
 7. Rotate all pieces where `piece_mi_list[pi][step_pos] == mi` by `micro_angle` around the pivot
-8. Compose rotation into `piece_plc[pi]` for each rotated piece
+8. Compose rotation into `piece_plc[pi]` for each rotated piece; do not transform the BRep at each micro-bend
 9. **(First occurrence of mi only, after rotation)** Save `wedge_post_mi_plc[wpi]`
 10. Rotate bend lines and components by the same transform, using piece-based multipliers where available
-11. Apply inset correction inside the Phase 3 loop to the affected non-wedge pieces, bend lines, and components
+11. Apply inset correction inside the Phase 3 loop to the affected piece placements, bend lines, and components
+12. After Phase 3, materialize each wedge's final rigid target once from its cached flat partition and final `piece_plc`; the wedge builder uses this target for anchor and placement checks
 
 ---
 
@@ -268,24 +358,22 @@ Current dispatch behavior:
 1. Retrieve saved pivot data (virtual_plc, cur_p0, cur_normal, cur_up, bend_axis, coc)
 2. Get `positioned_flat` = `wedge_pre_shapes[pi]` or `piece_shapes[pi]`
 3. If the bend has multiple center segments, choose the nearest saved segment midpoint for this wedge and recompute `cur_p0` / pivot for that segment
-4. Build d-values:
-   - `d_uniform`: N_SLICES+1 uniform positions in [gt, 2*ins - gt]
-   - Vertex projections of positioned_flat → `vertex_proj_ds` (split points where cross-section topology may change)
-5. Split d-range into sub-ranges at vertex projection planes. Each sub-range has consistent cross-section topology.
-6. For each sub-range:
-   - Collect uniform d-values falling within the sub-range, plus boundary d-values
-   - For each d-value:
-     - Slice positioned_flat perpendicular to cur_normal at distance d from cur_p0
-     - Compute `frac = (d - gt) / (2*ins - 2*gt)` and `slice_angle = frac * sweep_angle`
-     - Translate slice back by -d along cur_normal (to stationary edge)
-     - Rotate slice by slice_angle around CoC along bend_axis
-     - Use the first returned wire from `slice()` for that cross-section
-   - Reorder vertices: OCCT's `slice()` can return vertices in different cyclic order depending on slice position; align each wire to match the first wire by trying all cyclic rotations and both directions
-   - Collect as one loft segment
-7. Build wedge output:
-   - in wireframe mode: compound all slice wires
-   - in smooth mode: rebuild the wedge from bent source faces instead of turning the slice stack directly into one user-facing solid
-8. Apply remaining Phase 3 rotations (`piece_plc[pi] * wedge_post_mi_plc[pi]^-1`) to catch rotations that happened after the wedge's own mi
+4. Extract the flat wedge's top, bottom, and side faces plus their unique
+   boundary edges.
+5. Build wedge output:
+   - in wireframe mode: bend the source edges analytically
+   - in smooth mode: rebuild the wedge from bent source faces
+6. When `BuildDebugObjects` is enabled, additionally generate legacy
+   cross-section slices at uniform and vertex-projection d-values for topology
+   diagnostics. These OCC `slice()` results are not inputs to either production
+   builder and are skipped during normal bending.
+7. Apply remaining Phase 3 rotations (`piece_plc[pi] * wedge_post_mi_plc[pi]^-1`) to catch rotations that happened after the wedge's own mi.
+   If the wedge's own mi is the last transform in its chain, a remaining pure
+   translation is known to be only that bend's inset correction. The curved
+   rebuild already spans that correction, so its output placement stays at
+   zero without a BRep distance query. If later bends exist but compose into a
+   pure translation, the original adjacency-based 0/0.5/1.0 candidate scoring
+   is retained.
 
 ### Smooth Hybrid Rebuild
 
@@ -303,7 +391,9 @@ The smooth wedge builder uses a local frame for each wedge:
 Notes:
 
 - Top or bottom caps can collapse to a line after bending; these are reported as `collapsed-to-line`
-- Cap collapse is detected from sampled bent boundary points, not just by counting distinct end vertices
+- Cap collapse first uses transformed source vertices as a safe negative test:
+  non-collinear vertices prove the cap remains a surface. Ambiguous collinear
+  endpoints retain the dense bent-boundary sampling check.
 - `collapsed-to-line` and `dropped` are different outcomes:
   `collapsed-to-line` means the cap legitimately degenerates to a line and is omitted from the shell
   `dropped` means no acceptable rebuilt face or local triangle fallback could be produced
@@ -318,6 +408,13 @@ Notes:
 - Triangle fallback density is intentionally lighter than the normal `Smooth` target: local fallback faces use one subdivision level less than the configured smooth split count
 - `Smooth` attempts a single source-topology rebuild for each wedge
 - If shell building fails, the smooth wedge rebuild stops at that single source-topology attempt
+- Solidification first tests the normal `Part.makeShell` result by itself.
+  Duplicate `Shell`, compound, sew, and fix candidates are constructed only
+  when that primary shell cannot produce a valid, aligned solid.
+- Each solid candidate is validated before the next repair is constructed.
+  A raw-valid solid therefore skips the expensive `fix`, `removeSplitter`, and
+  combined repair copies; they remain available in the same order for invalid
+  candidates.
 - Smooth solid selection now ranks repaired shell candidates by volume error first, then by anchor alignment
 - If collapsed faces, dropped faces, or local triangle fallback were involved, a source-topology solid with high `vol_rel` is rejected outright
 - If every smooth-stage solid attempt fails, the user-facing `Smooth` mode falls back to analytic wireframe for that wedge
