@@ -7,7 +7,7 @@ PCB editing and mechanical assembly.
 
 ## Features
 
-- Linking external KiCad `.kicad_pcb` files
+- Opening, importing, or dragging external `.kicad_pcb` files as linked PCB objects
 - Editing board outlines
 - Importing solid stiffeners from annotated `F.Stiffener` and `B.Stiffener` layers
 - Bending flexible PCBs from a KiCad user layer named `FreekiCAD`
@@ -31,6 +31,11 @@ models without KiCad.
 
 The [FPC assembly example][fpc-assembly-example] shows a `.kkkk_asm` manifest
 containing linked KiCad PCB files.
+
+FreeCAD's Open and Import commands and drag-and-drop all create the same linked
+`PcbObject` as **FreekiCAD > Add KiCad PCB**. STEP extensions remain assigned to
+FreeCAD's built-in STEP importer; use **FreekiCAD > Add STEP** when a reloadable
+linked STEP object is wanted.
 
 ## Manual Installation
 
@@ -110,6 +115,8 @@ including connector faces on bent sections, may not align correctly. This
 limitation does not affect direct `App::Link` placement, Manipulator alignment,
 coupler-based alignment, or flattened `.kkkk_asm` export. `StepObject` geometry
 is stored directly on the linked object and is not subject to this limitation.
+Use the Manipulator workbench when a PCB child or bent-section face cannot be
+aligned with an Assembly joint.
 
 When exporting `.kkkk_asm`, the selection determines which placement is
 exported:
@@ -139,32 +146,54 @@ same KiCad reference. FreekiCAD moves the entire `CouplerMoving` board so the
 two coupler planes meet face-to-face. `SnapToCoupler` is enabled by default on
 linked PCB objects; disable it to exclude a board from automatic alignment.
 
-Alternatively, place one `CouplerOrigin` footprint on a PCB to align its plane
-with world origin `(0, 0, 0)` at zero rotation and tilt. A PCB may use only one
-positioning source: one `CouplerMoving` or one `CouplerOrigin`. Alignment is
+Alternatively, place one `CouplerAt` footprint on a PCB to align its plane
+with the absolute FreeCAD world coordinates stored in its `TargetX`,
+`TargetY`, and `TargetZ` properties. All three default to `0 mm`, which
+places the plane at the world origin.
+Usually place `CouplerAt` on B.Cu so the PCB bottom surface is positioned at
+`TargetZ`; use F.Cu only when the top surface should be the reference.
+A PCB may use only one positioning source: one `CouplerMoving` or one
+`CouplerAt`. Alignment is
 recalculated in dependency order after linked boards reload and uses the
 coupler planes after flexible-PCB bending.
 
-The plane is defined by the footprint position, board side, rotation, and two
+The plane is defined by the footprint position, board side, rotation, and
 custom footprint properties:
 
-- `Z` offsets the plane origin along its local Z axis. It defaults to `0 mm`;
-  unitless values are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and
-  `um` are supported. The origin starts at the PCB surface, including board
-  thickness on the front side, and local Z is reversed on the back side.
+- `CouplerFixed` and `CouplerMoving` use `Z` to offset the plane origin along
+  the PCB surface normal. The origin starts at the PCB surface, including
+  board thickness on the front side, and the direction is reversed on the
+  back side.
+- `Offset` moves the plane origin on the PCB surface in the direction shown by
+  the footprint triangle. Both `Z` and `Offset` default to `0 mm`; unitless
+  values are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um` are
+  supported.
 - `Tilt` rotates the plane around its local X axis, in degrees, and defaults
-  to `0`. It does not change the Z-offset origin.
+  to `0`. Placement applies the footprint pose, `Offset`, `Z`, then `Tilt`;
+  the tilt axis passes through the offset origin and does not redirect either
+  displacement.
+
+`CouplerAt` also has `TargetX`, `TargetY`, and `TargetZ` properties for its
+absolute FreeCAD world target. All three default to `0 mm`; unitless values
+are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um` are supported.
+It has no local `Z` property. B.Cu is recommended for the usual bottom-surface
+placement at `TargetZ`; use F.Cu only to reference the top surface.
 
 Each coupler is represented by a FreeCAD child object whose plane marker is
-hidden by default. Its `X`, `Y`, `Z`, and `Tilt` properties are editable in
-FreeCAD; edits update alignment immediately and are written back to the live
-KiCad footprint. FreekiCAD also checks the live KiCad document every second,
-so unsaved position, side, rotation, `Z`, and `Tilt` edits update the marker
-and alignment. Adding or removing couplers, or changing their identity, takes
+hidden by default and can be shown for inspection. Its footprint-position and
+`Z`/`Offset`/`Tilt` properties are
+editable in FreeCAD; edits update alignment immediately and are written back
+to the live KiCad footprint. Older footprints without `Offset` load with a
+zero offset; the field is created automatically when `Offset` is first edited
+in FreeCAD. FreekiCAD also checks the live KiCad document
+every second, so unsaved position, side, rotation, and plane-property edits
+update the marker
+and alignment; `CouplerAt` target edits update its absolute alignment as well.
+Adding or removing couplers, or changing their identity, takes
 effect after reloading the PCB.
 
 The footprints are available in Kikakuka's
-[`resources/kikakuka.pretty` library][coupler-library].
+[`kicad-addon` directory][coupler-library].
 
 ## Flexible PCB Stiffener
 
@@ -179,7 +208,7 @@ Name=Tail reinforcement
 Material=Polyimide
 Color=#C87518
 Opacity=0.65
-Thickness=250 um
+Thickness=25 um
 ```
 
 `Material` and `Thickness` are required. `Name`, `Color`, and `Opacity` are
@@ -252,6 +281,6 @@ This repository is a release mirror. Development takes place in the
 [FreekiCAD directory of the Kikakuka repository][upstream].
 
 [upstream]: https://github.com/buganini/Kikakuka/tree/main/FreekiCAD
-[coupler-library]: https://github.com/buganini/Kikakuka/tree/main/resources/kikakuka.pretty
+[coupler-library]: https://github.com/buganini/Kikakuka/tree/main/kicad-addon
 [fpc-assembly-example]: https://github.com/buganini/Kikakuka/blob/main/samples/fpc-assembly.kkkk_asm
 [fpc-sample]: https://github.com/buganini/Kikakuka/blob/main/samples/fpc.kicad_pcb

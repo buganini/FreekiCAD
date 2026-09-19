@@ -25,8 +25,8 @@ COPPER_STRAIN_WARNING = 0.05
 
 COUPLER_MOVING = "CouplerMoving"
 COUPLER_FIXED = "CouplerFixed"
-COUPLER_ORIGIN = "CouplerOrigin"
-_COUPLER_TYPES = {COUPLER_MOVING, COUPLER_FIXED, COUPLER_ORIGIN}
+COUPLER_AT = "CouplerAt"
+_COUPLER_TYPES = {COUPLER_MOVING, COUPLER_FIXED, COUPLER_AT}
 COUPLER_MONITOR_INTERVAL_MS = 1000
 PCB_OBJECT_TYPES = {"PcbObject", "LinkedObject"}
 # Master switch for coupler synchronization in both directions.
@@ -329,8 +329,8 @@ def _footprint_field_value(footprint, field_name, default=None):
     return default
 
 
-def _set_footprint_field_value(footprint, field_name, value):
-    """Set a named custom footprint field through the KiCad API wrapper."""
+def _set_footprint_field_value(footprint, field_name, value, create=False):
+    """Set, and optionally create, a custom footprint field via KiCad IPC."""
     try:
         fields = footprint.texts_and_fields
     except Exception:
@@ -353,7 +353,40 @@ def _set_footprint_field_value(footprint, field_name, value):
                 return True
             except Exception:
                 continue
-    return False
+    if not create:
+        return False
+
+    # kicad-python exposes Footprint.add_item(), but does not provide a
+    # convenience constructor for custom fields.  Clone the existing Z field
+    # so the new hidden field inherits the footprint position, layer, text
+    # style, and parent.  Assign both IDs explicitly to avoid duplicating the
+    # source field's identifiers when the footprint is packed for update.
+    try:
+        import uuid
+        from kipy.board_types import Field
+
+        definition = footprint.definition
+        fields = [item for item in definition.items
+                  if isinstance(item, Field)]
+        template = next(
+            (field for field in fields if field.name == 'Z'),
+            fields[0] if fields else None)
+        if template is None:
+            return False
+
+        proto = template.proto.__class__()
+        proto.CopyFrom(template.proto)
+        proto.id.id = max(
+            [int(field.field_id) for field in fields] + [3]) + 1
+        proto.text.id.value = str(uuid.uuid4())
+        new_field = Field(proto=proto)
+        new_field.name = field_name
+        new_field.text.value = str(value)
+        new_field.visible = False
+        definition.add_item(new_field)
+        return True
+    except Exception:
+        return False
 
 
 def _quantity_value(value):
@@ -366,6 +399,20 @@ def _parse_coupler_z(value):
     if value is None:
         return 0.0
     return parse_length_mm(value, "Z")
+
+
+def _parse_coupler_offset(value):
+    """Parse the in-plane coupler offset in millimetres."""
+    if value is None:
+        return 0.0
+    return parse_length_mm(value, "Offset")
+
+
+def _parse_coupler_at_coordinate(value, field_name):
+    """Parse an absolute CouplerAt world coordinate in millimetres."""
+    if value is None:
+        return 0.0
+    return parse_length_mm(value, field_name)
 
 
 def _parse_coupler_tilt(value):
@@ -394,19 +441,30 @@ def _coupler_pose_from_footprint(footprint, thickness):
         ref = "?"
     position = footprint.position
     is_back = footprint.layer == BoardLayer.BL_B_Cu
-    return {
+    pose = {
         'ref': ref,
         'type': coupler_type,
         'x': position.x / 1e6,
         'y': -position.y / 1e6,
         'board_z': 0.0 if is_back else thickness,
         'is_back': is_back,
-        'z': _parse_coupler_z(
-            _footprint_field_value(footprint, 'Z', 0)),
+        'z': (0.0 if coupler_type == COUPLER_AT else _parse_coupler_z(
+            _footprint_field_value(footprint, 'Z', 0))),
+        'offset': (0.0 if coupler_type == COUPLER_AT
+                   else _parse_coupler_offset(
+                       _footprint_field_value(footprint, 'Offset', 0))),
         'tilt': _parse_coupler_tilt(
             _footprint_field_value(footprint, 'Tilt', 0)),
         'rotation': _coupler_rotation_degrees(footprint),
     }
+    if coupler_type == COUPLER_AT:
+        pose['target_x'] = _parse_coupler_at_coordinate(
+            _footprint_field_value(footprint, 'TargetX', 0), 'TargetX')
+        pose['target_y'] = _parse_coupler_at_coordinate(
+            _footprint_field_value(footprint, 'TargetY', 0), 'TargetY')
+        pose['target_z'] = _parse_coupler_at_coordinate(
+            _footprint_field_value(footprint, 'TargetZ', 0), 'TargetZ')
+    return pose
 
 
 def _select_monitored_coupler_poses(monitored, live):
@@ -434,9 +492,44 @@ def _select_monitored_coupler_poses(monitored, live):
 def _coupler_pose_signature(poses):
     """Return the live fields which affect coupler placement."""
     fields = (
-        'ref', 'type', 'x', 'y', 'board_z', 'is_back', 'z', 'tilt',
-        'rotation')
+        'ref', 'type', 'x', 'y', 'board_z', 'is_back', 'z', 'offset', 'tilt',
+        'rotation', 'target_x', 'target_y', 'target_z')
     return tuple(tuple(pose.get(field) for field in fields) for pose in poses)
+
+
+def _nearest_bend_piece(pieces, point, excluded=None):
+    """Return the PCB piece nearest to a footprint origin outside the solid.
+
+    A connector or coupler origin can lie in a slot, a drill hole, or beyond
+    the board edge.  It still has to inherit the bend transform of the nearest
+    rigid PCB piece.  Prefer non-strip pieces because a bend strip is not a
+    stable mounting surface.
+    """
+    excluded = set(excluded or ())
+    try:
+        point_shape = Part.Vertex(point)
+    except Exception:
+        return None, None
+
+    def _closest(skip_excluded):
+        best_index = None
+        best_distance = None
+        for index, piece in enumerate(pieces):
+            if skip_excluded and index in excluded:
+                continue
+            try:
+                distance = float(piece.distToShape(point_shape)[0])
+            except Exception:
+                continue
+            if best_distance is None or distance < best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index, best_distance
+
+    result = _closest(bool(excluded))
+    if result[0] is None and excluded:
+        result = _closest(False)
+    return result
 
 
 def _signed_line_side_2d(point, seg_p0, seg_p1):
@@ -1559,6 +1652,7 @@ def load_board(filepath, socket_path, import_outer_copper=False,
                         f"FreekiCAD:   {ref}: found {coupler_type} "
                         f"surfaceZ={couplers_data[-1]['board_z']:.4g}mm "
                         f"Z={couplers_data[-1]['z']:.4g}mm "
+                        f"Offset={couplers_data[-1]['offset']:.4g}mm "
                         f"Tilt={couplers_data[-1]['tilt']:.4g}deg\n")
                 except Exception as ex:
                     FreeCAD.Console.PrintWarning(
@@ -2014,7 +2108,7 @@ class CouplerMarker:
         pass
 
     def onChanged(self, obj, prop):
-        if prop not in ("X", "Y", "Z", "Tilt"):
+        if prop not in ("X", "Y", "Z", "Offset", "Tilt"):
             return
         try:
             if obj.Document.Restoring:
@@ -2034,8 +2128,9 @@ class CouplerMarker:
         return None
 
     def onDocumentRestored(self, obj):
-        # Z and Tilt used to be read-only.  Keep restored documents editable.
-        for prop in ("Z", "Tilt"):
+        # Plane properties used to be read-only.  Keep restored documents
+        # editable; the parent proxy adds Offset to older markers first.
+        for prop in ("Z", "Offset", "Tilt"):
             try:
                 obj.setPropertyStatus(prop, "-ReadOnly")
             except Exception:
@@ -2055,6 +2150,7 @@ class _OutlineSketchObserver:
         self._constraining = False  # re-entrancy guard
         self._move_timers = {}  # obj.Name → QTimer for debounce
         self._move_timer_parents = {}  # obj.Name → parent.Name
+        self._component_edits = set()
 
     def suppress(self, name):
         self._suppressed.add(name)
@@ -2087,6 +2183,11 @@ class _OutlineSketchObserver:
                 return parent
         return None
 
+    @staticmethod
+    def _component_edit_key(obj):
+        document = getattr(obj, 'Document', None)
+        return (getattr(document, 'Name', None), obj.Name)
+
     def _is_bending_active(self, parent):
         """True when EnableBending is on and at least one bend child
         has Active=True and a non-zero Angle."""
@@ -2106,7 +2207,7 @@ class _OutlineSketchObserver:
                 return proxy._is_component_move_blocked(parent)
             except Exception:
                 pass
-        return self._is_bending_active(parent)
+        return False
 
     def _surface_reload_pending(self, parent):
         proxy = getattr(parent, "Proxy", None)
@@ -2148,6 +2249,38 @@ class _OutlineSketchObserver:
                     f"outline open suppressed during debounce: {obj.Name}")
                 return
             parent.Proxy._on_outline_edit_start(parent)
+            return
+        parent = self._find_component_parent(obj)
+        if parent is not None:
+            self._component_edits.add(self._component_edit_key(obj))
+
+    def _is_component_focused(self, obj, parent):
+        """True when the component is the target of a GUI edit/selection.
+
+        A Placement notification does not say whether it came from a user or
+        a recompute.  Edit mode covers FreeCAD's transform tool; selection
+        covers the property editor and Manipulator.  Nested selections use
+        the PcbObject as the selected object and the component name as the
+        first subelement path segment.
+        """
+        if self._component_edit_key(obj) in self._component_edits:
+            return True
+        if not getattr(FreeCAD, "GuiUp", False):
+            return False
+        try:
+            import FreeCADGui
+            for selected in FreeCADGui.Selection.getSelectionEx():
+                if getattr(selected, 'Object', None) is obj:
+                    return True
+                if getattr(selected, 'Object', None) is not parent:
+                    continue
+                prefix = obj.Name + "."
+                for sub_name in getattr(selected, 'SubElementNames', ()):
+                    if sub_name == obj.Name or sub_name.startswith(prefix):
+                        return True
+        except Exception:
+            return False
+        return False
 
     def slotChangedObject(self, obj, prop):
         try:
@@ -2159,7 +2292,7 @@ class _OutlineSketchObserver:
 
         # Also covers coupler markers restored from older documents, where
         # the child was a plain Part::Feature without a Python proxy.
-        if prop in ("X", "Y", "Z", "Tilt") \
+        if prop in ("X", "Y", "Z", "Offset", "Tilt") \
                 and hasattr(obj, 'CouplerType') \
                 and getattr(getattr(obj, 'Proxy', None), 'Type', None) \
                 != 'CouplerMarker':
@@ -2177,11 +2310,15 @@ class _OutlineSketchObserver:
                 return
             parent = self._find_component_parent(obj)
             if parent is not None:
-                # Skip when bending is active — placement changes are
-                # cosmetic (applied by the bend transform).
+                # Internal reload/rebend placement changes are suppressed by
+                # the parent proxy.  A completed bend is not itself a reason
+                # to block editing: user transforms are mapped back through
+                # the stored bend placement below.
                 if self._is_component_move_blocked(parent):
                     return
-                self._constrain_placement(obj)
+                if not self._is_component_focused(obj, parent):
+                    return
+                self._constrain_placement(obj, parent)
                 if self._is_component_move_blocked(parent):
                     return
                 self._schedule_move_component(obj, parent)
@@ -2214,14 +2351,49 @@ class _OutlineSketchObserver:
                 proxy._on_outline_edit_start(parent)
             proxy._on_outline_changed(parent)
 
-    def _constrain_placement(self, obj):
+    def _flat_component_placement(self, obj, parent):
+        """Return the component placement in the unbent PCB frame.
+
+        Component shapes already contain their KiCad position.  Bending is
+        represented by an additional Placement on the component object.  The
+        hidden bend placement records that transform before the user edits
+        it, allowing a transform on a bent face to be converted back to the
+        flat board coordinates expected by KiCad.
+        """
+        init_p = getattr(obj, 'FreekiCAD_InitPlacement', None)
+        if init_p is None:
+            return None
+        bend_p = getattr(obj, 'FreekiCAD_BendPlacement', None)
+        if bend_p is None:
+            # Old documents may not have the migration property until their
+            # first idle/reload pass.  Flat boards can safely use InitPlacement
+            # as the baseline, but guessing on an already bent board would
+            # produce an incorrect KiCad position.
+            if self._is_bending_active(parent):
+                return None
+            bend_p = init_p
+        bend_transform = bend_p.multiply(init_p.inverse())
+        return bend_transform.inverse().multiply(obj.Placement)
+
+    def _bent_component_placement(self, obj, flat_placement):
+        """Map an unbent component placement back to its displayed frame."""
+        init_p = getattr(obj, 'FreekiCAD_InitPlacement', None)
+        bend_p = getattr(obj, 'FreekiCAD_BendPlacement', None)
+        if init_p is None or bend_p is None:
+            return flat_placement
+        bend_transform = bend_p.multiply(init_p.inverse())
+        return bend_transform.multiply(flat_placement)
+
+    def _constrain_placement(self, obj, parent):
         """Constrain component Placement: allow X/Y move + Z rotation only.
-        Z position, pitch, and roll are locked to the initial placement."""
+        Z position, pitch, and roll are locked in the unbent PCB frame."""
         init_p = getattr(obj, 'FreekiCAD_InitPlacement', None)
         if init_p is None:
             return
 
-        p = obj.Placement
+        p = self._flat_component_placement(obj, parent)
+        if p is None:
+            return
         pos = p.Base
         rot = p.Rotation
 
@@ -2240,9 +2412,11 @@ class _OutlineSketchObserver:
         if needs_fix:
             self._constraining = True
             try:
-                obj.Placement = FreeCAD.Placement(
+                flat_placement = FreeCAD.Placement(
                     FreeCAD.Vector(pos.x, pos.y, init_z),
                     FreeCAD.Rotation(yaw, init_pitch, init_roll))
+                obj.Placement = self._bent_component_placement(
+                    obj, flat_placement)
             finally:
                 self._constraining = False
 
@@ -2294,8 +2468,13 @@ class _OutlineSketchObserver:
             if init_p is None:
                 return
 
-            p = obj.Placement
-            # Compute delta from initial FreeCAD placement
+            p = self._flat_component_placement(obj, parent)
+            if p is None:
+                FreeCAD.Console.PrintWarning(
+                    f"FreekiCAD: Cannot map bent component '{ref}' "
+                    "to flat PCB coordinates; reload the PCB and retry\n")
+                return
+            # Compute delta in the unbent PCB frame.
             delta_x = p.Base.x - init_p.Base.x
             delta_y = p.Base.y - init_p.Base.y
             yaw, _, _ = p.Rotation.getYawPitchRoll()
@@ -2336,7 +2515,7 @@ class _OutlineSketchObserver:
             return
         if getattr(getattr(obj, 'Document', None), 'Restoring', False):
             return
-        pass
+        self._component_edits.discard(self._component_edit_key(obj))
 
 
 def _find_obj_by_label(label):
@@ -2469,7 +2648,7 @@ class PcbObject:
         obj.Label2 = "AutoReload=On"
         obj.addProperty(
             "App::PropertyBool", "SnapToCoupler", "LinkedFile",
-            "Enable CouplerMoving or CouplerOrigin positioning"
+            "Enable CouplerMoving or CouplerAt positioning"
         )
         obj.SnapToCoupler = True
         obj.addProperty(
@@ -2562,13 +2741,24 @@ class PcbObject:
                     marker.addProperty(
                         'App::PropertyDistance', name, 'Coupler', description)
                 setattr(marker, name, float(pose.get(name.lower(), 0)))
-            for name in ('Z', 'Tilt'):
+            if coupler_type != COUPLER_AT and not hasattr(marker, 'Offset'):
+                marker.addProperty(
+                    'App::PropertyDistance', 'Offset', 'Coupler',
+                    'Offset along the triangle direction on the PCB surface')
+            if coupler_type != COUPLER_AT:
+                marker.Offset = float(pose.get('offset', 0))
+            for name in ('Z', 'Offset', 'Tilt'):
                 try:
                     marker.setPropertyStatus(name, '-ReadOnly')
                 except Exception:
                     pass
             if getattr(marker, 'TypeId', '') == 'Part::FeaturePython':
                 CouplerMarker(marker)
+                view_object = getattr(marker, 'ViewObject', None)
+                if view_object is not None:
+                    # Use FreeCAD's standard shape view provider so tree
+                    # visibility can be toggled normally.
+                    view_object.Proxy = 0
 
     @staticmethod
     def _rebuild_setting_value(obj, prop):
@@ -2666,16 +2856,36 @@ class PcbObject:
 
     def _is_component_move_blocked(self, obj=None):
         self._ensure_component_sync_state()
-        if self._component_sync_suspended or getattr(self, '_bending', False):
-            return True
-        if obj is None or not getattr(obj, 'EnableBending', False):
-            return False
-        for c in getattr(obj, 'Group', []):
-            proxy = getattr(c, 'Proxy', None)
-            if proxy and getattr(proxy, 'Type', None) == 'BendLine':
-                if c.Active and c.Angle.Value != 0:
-                    return True
-        return False
+        return (self._component_sync_suspended
+                or getattr(self, '_bending', False))
+
+    @staticmethod
+    def _set_component_bend_placement(component):
+        """Record the component's displayed placement before user edits."""
+        if not hasattr(component, 'FreekiCAD_BendPlacement'):
+            component.addProperty(
+                "App::PropertyPlacement", "FreekiCAD_BendPlacement",
+                "FreekiCAD", "Placement after flex PCB bending")
+            try:
+                component.setPropertyStatus(
+                    "FreekiCAD_BendPlacement", "Hidden")
+            except Exception:
+                pass
+        try:
+            component.FreekiCAD_BendPlacement = component.Placement.copy()
+        except Exception:
+            component.FreekiCAD_BendPlacement = component.Placement
+
+    def _capture_component_bend_placements(self, obj, missing_only=False):
+        """Capture the bend baseline used to map GUI edits back to KiCad."""
+        for component in getattr(obj, 'Group', []):
+            if (not hasattr(component, 'X')
+                    or hasattr(component, 'CouplerType')):
+                continue
+            if missing_only and hasattr(
+                    component, 'FreekiCAD_BendPlacement'):
+                continue
+            self._set_component_bend_placement(component)
 
     def _suspend_component_move_sync(self, obj=None):
         self._ensure_component_sync_state()
@@ -3402,6 +3612,7 @@ class PcbObject:
                               thickness, enable_bending=enable)
         elif board_obj:
             self._update_conflicts_debug_object(obj, None, thickness)
+        self._capture_component_bend_placements(obj)
         # Cancel any pending rebend timer — bending was already
         # handled by _apply_bends above.
         timer = getattr(self, '_rebend_timer', None)
@@ -3500,9 +3711,13 @@ class PcbObject:
         pose.update({
             'x': _quantity_value(marker.X),
             'y': _quantity_value(marker.Y),
-            'z': _quantity_value(marker.Z),
             'tilt': _quantity_value(marker.Tilt),
         })
+        pose['z'] = (0.0 if coupler_type == COUPLER_AT
+                     else _quantity_value(marker.Z))
+        pose['offset'] = (0.0 if coupler_type == COUPLER_AT
+                          else _quantity_value(
+                              getattr(marker, 'Offset', 0)))
         obj.CouplerPoses = json.dumps(poses)
         placement = self._coupler_placement(pose)
         self._updating_coupler_markers = True
@@ -3524,6 +3739,7 @@ class PcbObject:
                 'x': pose['x'],
                 'y': pose['y'],
                 'z': pose['z'],
+                'offset': pose['offset'],
                 'tilt': pose['tilt'],
             }
             self._pending_coupler_updates[reference] = update
@@ -3609,7 +3825,9 @@ class PcbObject:
         if target_fp is None:
             raise ValueError(f"coupler '{reference}' not found in KiCad")
 
-        missing = [name for name in ('Z', 'Tilt')
+        required_fields = (('Tilt',) if update['type'] == COUPLER_AT
+                           else ('Z', 'Tilt'))
+        missing = [name for name in required_fields
                    if _footprint_field_value(target_fp, name, None) is None]
         if missing:
             raise ValueError(
@@ -3618,9 +3836,16 @@ class PcbObject:
         commit = board.begin_commit()
         target_fp.position = Vector2.from_xy_mm(
             update['x'], -update['y'])
-        if not _set_footprint_field_value(
-                target_fp, 'Z', f"{update['z']:.12g} mm"):
-            raise ValueError("could not update coupler field Z")
+        if update['type'] != COUPLER_AT:
+            if not _set_footprint_field_value(
+                    target_fp, 'Z', f"{update['z']:.12g} mm"):
+                raise ValueError("could not update coupler field Z")
+            offset_written = _set_footprint_field_value(
+                target_fp, 'Offset',
+                f"{float(update.get('offset', 0)):.12g} mm", create=True)
+            if not offset_written and abs(float(
+                    update.get('offset', 0))) > 1e-12:
+                raise ValueError("could not update coupler field Offset")
         if not _set_footprint_field_value(
                 target_fp, 'Tilt', f"{update['tilt']:.12g} deg"):
             raise ValueError("could not update coupler field Tilt")
@@ -3773,6 +3998,7 @@ class PcbObject:
                         ('X', float(pose.get('x', 0))),
                         ('Y', float(pose.get('y', 0))),
                         ('Z', float(pose.get('z', 0))),
+                        ('Offset', float(pose.get('offset', 0))),
                         ('Tilt', float(pose.get('tilt', 0)))):
                     try:
                         setattr(marker, prop, value)
@@ -3812,7 +4038,7 @@ class PcbObject:
             f"FreekiCAD: Coupler monitor unavailable: {message}\n")
 
     def _build_coupler_children(self, obj, couplers):
-        """Create visible child markers for the board's coupler planes."""
+        """Create hidden child markers for the board's coupler planes."""
         doc = obj.Document
         for index, pose in enumerate(couplers):
             coupler_type = pose.get('type', '')
@@ -3827,7 +4053,7 @@ class PcbObject:
 
             marker.addProperty(
                 "App::PropertyString", "CouplerType", "Coupler",
-                "CouplerFixed, CouplerMoving, or CouplerOrigin")
+                "CouplerFixed, CouplerMoving, or CouplerAt")
             marker.addProperty(
                 "App::PropertyString", "Reference", "Coupler",
                 "KiCad reference used to match the coupler")
@@ -3837,9 +4063,13 @@ class PcbObject:
             marker.addProperty(
                 "App::PropertyDistance", "Y", "Coupler",
                 "Coupler footprint Y coordinate (FreeCAD convention)")
-            marker.addProperty(
-                "App::PropertyDistance", "Z", "Coupler",
-                "Coupler-plane displacement")
+            if coupler_type != COUPLER_AT:
+                marker.addProperty(
+                    "App::PropertyDistance", "Z", "Coupler",
+                    "Coupler-plane displacement")
+                marker.addProperty(
+                    "App::PropertyDistance", "Offset", "Coupler",
+                    "Offset along the triangle direction on the PCB surface")
             marker.addProperty(
                 "App::PropertyAngle", "Tilt", "Coupler",
                 "Coupler-plane tilt around footprint-local X")
@@ -3847,7 +4077,9 @@ class PcbObject:
             marker.Reference = str(ref)
             marker.X = float(pose.get('x', 0))
             marker.Y = float(pose.get('y', 0))
-            marker.Z = z
+            if coupler_type != COUPLER_AT:
+                marker.Z = z
+                marker.Offset = float(pose.get('offset', 0))
             marker.Tilt = float(pose.get('tilt', 0))
             for prop in ('CouplerType', 'Reference'):
                 try:
@@ -3884,6 +4116,10 @@ class PcbObject:
             CouplerMarker(marker)
 
             try:
+                # Part::FeaturePython starts with a Python view provider.
+                # CouplerMarker only needs a data proxy; the standard shape
+                # provider gives it normal show/hide behavior in the tree.
+                marker.ViewObject.Proxy = 0
                 marker.ViewObject.Visibility = False
                 marker.ViewObject.LineWidth = 4.0
                 marker.ViewObject.Transparency = 35
@@ -3911,14 +4147,23 @@ class PcbObject:
                 FreeCAD.Vector(0, 0, 0),
                 FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), 180))
             placement = placement.multiply(back_side)
+        # KiCad's original local +Y points downward on the canvas and is the
+        # direction indicated by the coupler triangle.  FreeCAD's converted
+        # footprint frame reverses Y, so a positive Offset is local -Y here.
+        in_plane_offset = FreeCAD.Placement(
+            FreeCAD.Vector(0, -float(pose.get('offset', 0)), 0),
+            FreeCAD.Rotation())
         z_offset = FreeCAD.Placement(
             FreeCAD.Vector(0, 0, float(pose.get('z', 0))),
             FreeCAD.Rotation())
-        placement = placement.multiply(z_offset)
+        placement = placement.multiply(in_plane_offset).multiply(z_offset)
         tilt = FreeCAD.Placement(
             FreeCAD.Vector(0, 0, 0),
             FreeCAD.Rotation(
                 FreeCAD.Vector(1, 0, 0), float(pose.get('tilt', 0))))
+        # Z is measured along the PCB surface normal.  Tilt changes only the
+        # plane orientation around the footprint-local X axis; it must not
+        # rotate the Z displacement away from the board normal.
         return placement.multiply(tilt)
 
     def _coupler_local_placement(self, obj, pose):
@@ -4004,24 +4249,32 @@ class PcbObject:
                 f"'{fixed_obj.Label}': {ex}\n")
             return False
 
-    def _snap_origin_object(self, moving_obj, origin_pose):
-        """Mate an origin coupler with a virtual fixed coupler at world zero."""
+    def _snap_at_object(self, moving_obj, at_pose):
+        """Mate a CouplerAt with a virtual fixed coupler at world X/Y/Z."""
         try:
             moving_local = self._coupler_local_placement(
-                moving_obj, origin_pose)
-            target_world = self._coupler_mating_placement()
+                moving_obj, at_pose)
+            target_world = FreeCAD.Placement(
+                FreeCAD.Vector(
+                    float(at_pose.get('target_x', 0)),
+                    float(at_pose.get('target_y', 0)),
+                    float(at_pose.get('target_z', 0))),
+                FreeCAD.Rotation()).multiply(
+                    self._coupler_mating_placement())
             moving_obj.Placement = target_world.multiply(
                 moving_local.inverse())
             self._log_coupler_alignment(
-                moving_obj, origin_pose, target_world)
+                moving_obj, at_pose, target_world)
             FreeCAD.Console.PrintMessage(
-                f"FreekiCAD: Snapped '{moving_obj.Label}' CouplerOrigin "
-                "to world origin face-to-face\n")
+                f"FreekiCAD: Snapped '{moving_obj.Label}' CouplerAt "
+                f"to world ({at_pose.get('target_x', 0):.6g}, "
+                f"{at_pose.get('target_y', 0):.6g}, "
+                f"{at_pose.get('target_z', 0):.6g}) face-to-face\n")
             return True
         except Exception as ex:
             FreeCAD.Console.PrintWarning(
                 f"FreekiCAD: Could not snap '{moving_obj.Label}' to "
-                f"world origin: {ex}\n")
+                f"CouplerAt target: {ex}\n")
             return False
 
     def _reposition_all_coupled_objects(self, doc):
@@ -4067,26 +4320,25 @@ class PcbObject:
                     continue
                 fixed_by_ref[ref] = (fixed_obj, pose)
 
-        # A moving object may have exactly one positioning source.  An origin
-        # coupler mates with a virtual fixed coupler at world (0, 0, 0).
+        # A moving object may have exactly one positioning source.  CouplerAt
+        # mates with a virtual fixed coupler at its absolute world X/Y/Z.
         assignments = {}
         for moving_obj in linked:
             moving_poses = self._coupler_poses(
                 moving_obj, COUPLER_MOVING)
-            origin_poses = self._coupler_poses(
-                moving_obj, COUPLER_ORIGIN)
-            if len(moving_poses) + len(origin_poses) > 1:
+            at_poses = self._coupler_poses(moving_obj, COUPLER_AT)
+            if len(moving_poses) + len(at_poses) > 1:
                 FreeCAD.Console.PrintError(
                     f"FreekiCAD: '{moving_obj.Label}' has "
                     f"{len(moving_poses)} CouplerMoving and "
-                    f"{len(origin_poses)} CouplerOrigin footprints; "
+                    f"{len(at_poses)} CouplerAt footprints; "
                     "skipping coupler positioning for this object\n")
                 continue
             if not getattr(moving_obj, 'SnapToCoupler', True):
                 continue
-            if origin_poses:
+            if at_poses:
                 assignments[moving_obj.Name] = (
-                    moving_obj, origin_poses[0], None, None)
+                    moving_obj, at_poses[0], None, None)
                 continue
             for moving_pose in moving_poses:
                 match = fixed_by_ref.get(moving_pose.get('ref'))
@@ -4119,7 +4371,7 @@ class PcbObject:
             moving_obj, moving_pose, fixed_obj, fixed_pose = \
                 assignments[moving_name]
             if fixed_obj is None:
-                snapped = self._snap_origin_object(
+                snapped = self._snap_at_object(
                     moving_obj, moving_pose)
             else:
                 snapped = self._snap_moving_object(
@@ -4305,6 +4557,7 @@ class PcbObject:
             if enable and active_bends and board_obj:
                 self._apply_bends(obj, board_obj, active_bends,
                                   thickness)
+            self._capture_component_bend_placements(obj)
         finally:
             self._bending = False
             self._resume_component_move_sync()
@@ -5558,17 +5811,40 @@ class PcbObject:
                     matched_tolerance = tolerance
                     break
             matched_piece = matches[0] if matches else None
+            fallback_distance = None
+            if matched_piece is None:
+                matched_piece, fallback_distance = _nearest_bend_piece(
+                    pieces, pt, excluded=strip_pieces)
             if matched_piece is not None:
                 comp_piece_idx[child.Name] = matched_piece
+            if fallback_distance is not None:
+                child_kind = (str(child.CouplerType)
+                              if hasattr(child, 'CouplerType')
+                              else "component")
+                child_label = (str(child.Reference)
+                               if hasattr(child, 'CouplerType')
+                               else str(child.Label))
+                FreeCAD.Console.PrintMessage(
+                    f"FreekiCAD: Nearest bend-piece fallback "
+                    f"'{obj.Label}/{child_label}' type={child_kind} "
+                    f"xy=({child_x:.6f},{child_y:.6f}) "
+                    f"distance={fallback_distance:.6f}mm "
+                    f"piece={matched_piece}\n")
             if hasattr(child, 'CouplerType'):
                 piece_text = (str(matched_piece)
                               if matched_piece is not None else "NONE")
+                if matched_tolerance is not None:
+                    match_text = f"inside:{matched_tolerance}mm"
+                elif fallback_distance is not None:
+                    match_text = f"nearest:{fallback_distance:.6f}mm"
+                else:
+                    match_text = "none"
                 FreeCAD.Console.PrintMessage(
                     f"FreekiCAD: Coupler bend-piece mapping "
                     f"'{obj.Label}/{child.Reference}' "
                     f"type={child.CouplerType} "
                     f"xy=({child_x:.6f},{child_y:.6f}) "
-                    f"tolerance={matched_tolerance}mm "
+                    f"match={match_text} "
                     f"candidates={matches} "
                     f"piece={piece_text}\n")
 
@@ -11942,7 +12218,7 @@ class PcbObject:
         if not hasattr(obj, 'SnapToCoupler'):
             obj.addProperty(
                 "App::PropertyBool", "SnapToCoupler", "LinkedFile",
-                "Enable CouplerMoving or CouplerOrigin positioning")
+                "Enable CouplerMoving or CouplerAt positioning")
             obj.SnapToCoupler = True
         if not hasattr(obj, 'CouplerPoses'):
             obj.addProperty(
@@ -12018,6 +12294,10 @@ class PcbObjectViewProvider:
         if obj.Document.Restoring or not obj.FileName:
             return
         proxy = getattr(obj, 'Proxy', None)
+        if proxy is not None and hasattr(
+                proxy, '_capture_component_bend_placements'):
+            proxy._capture_component_bend_placements(
+                obj, missing_only=True)
         if proxy is not None and hasattr(proxy, '_request_coupler_poll'):
             proxy._request_coupler_poll(obj)
 
@@ -12036,6 +12316,9 @@ class PcbObjectViewProvider:
             return
         if not hasattr(obj, "Proxy") or not hasattr(obj.Proxy, "_check_file_changed"):
             return
+        if hasattr(obj.Proxy, '_capture_component_bend_placements'):
+            obj.Proxy._capture_component_bend_placements(
+                obj, missing_only=True)
         # A layer-property change owns the next reload.  Do not let this
         # periodic poll bypass its two-second debounce because FileMtime is
         # already empty or the KiCad file also changed in the meantime.
