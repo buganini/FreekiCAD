@@ -5,8 +5,11 @@
 FreekiCAD bridges KiCad and FreeCAD, providing a FreeCAD-based workflow for
 PCB editing and mechanical assembly.
 
-All communication with KiCad and the Kikakuka Workspace Manager uses local IPC
-only. FreekiCAD does not send board, assembly, or usage data to third parties.
+FreekiCAD and Kikakuka discover each other on demand through local Unix sockets
+or Windows named pipes. No board, assembly, or usage data is sent to third
+parties. Kikakuka can find open FreeCAD documents and reuse an existing
+instance when opening a file; see [Instance Manager](https://github.com/buganini/Kikakuka/blob/main/doc/INSTANCE_MANAGER.md)
+for details.
 
 ![Bending+Assembly](https://github.com/buganini/Kikakuka/raw/main/screenshots/freekicad_bending_assembly.png)
 
@@ -37,11 +40,6 @@ models without KiCad.
 The [FPC assembly example][fpc-assembly-example] shows a `.kkkk_asm` manifest
 containing linked KiCad PCB files.
 
-> [!IMPORTANT]
-> Keep the Kikakuka Workspace Manager running while using FreekiCAD's KiCad
-> integration. It manages the KiCad instances and IPC API sockets used by
-> FreekiCAD. STEP-only workflows do not require it.
-
 FreeCAD's Open and Import commands and drag-and-drop all create the same linked
 `PcbObject` as **FreekiCAD > Add KiCad PCB**. STEP extensions remain assigned to
 FreeCAD's built-in STEP importer; use **FreekiCAD > Add STEP** when a reloadable
@@ -49,23 +47,22 @@ linked STEP object is wanted.
 
 ## Manual Installation
 
-FreekiCAD requires FreeCAD 1.0 or later. Importing STEP files and working with
-`.kkkk_asm` assemblies that contain only STEP objects require no additional
-Python dependencies. KiCad PCB integration requires KiCad 9.0 or later plus
-`kicad-python>=0.8,<0.9` and `shapely>=2.0.7`. These dependencies are optional
-because they are not used by the STEP-only workflow. When FreekiCAD is
-installed through the FreeCAD Addon Manager, compatible versions are selected
-from FreeCAD's Python package allow list and constraints.
+FreekiCAD requires FreeCAD 1.0 or later and `psutil>=5.9`
+for instance discovery and FreeCAD document-state publication. KiCad PCB
+integration additionally requires KiCad 9.0 or later plus
+`kicad-python>=0.8,<0.9` and `shapely>=2.0.7`; these two packages are optional
+for STEP-only workflows. FreeCAD Addon Manager may not automatically install
+`psutil` where its allowed-package list excludes it; install
+it manually inside FreeCAD if necessary.
 
 After copying the `FreekiCAD` folder into FreeCAD's `Mod` folder, open **View >
-Panels > Python Console** and paste this single line if you need KiCad
-integration. It waits for pip to finish, then prints its output:
+Panels > Python Console** and install `psutil`. For full KiCad
+integration, this single line also installs the KiCad extras. It waits for pip
+to finish, then prints its output:
 
 ```python
-import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys.executable),"python"),"-m","pip","install","kicad-python>=0.8,<0.9","shapely>=2.0.7"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout)
+import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys.executable),"python"),"-m","pip","install","kicad-python>=0.8,<0.9","shapely>=2.0.7","psutil>=5.9"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout)
 ```
-
-Restart FreeCAD after installation.
 
 ## Headless STEP Export
 
@@ -79,10 +76,11 @@ freecadcmd scripts/kkkk_export.py input.kicad_pcb output.step
 ```
 
 The exporter synchronously loads every object and component model before it
-writes the STEP file. Assemblies containing only STEP objects need no extra
-Python dependencies. For assemblies containing KiCad PCB objects, install
-`kicad-python` and `shapely` and keep the Kikakuka Workspace Manager running;
-it resolves or starts the matching KiCad instance and waits for its IPC API.
+writes the STEP file. Assemblies containing only STEP objects need no
+KiCad-specific Python dependencies beyond FreekiCAD's core packages. For
+assemblies containing KiCad PCB objects, install the KiCad extras above;
+FreekiCAD resolves or starts the matching KiCad
+instance itself and waits for its IPC API.
 Direct `.kicad_pcb` input has the same requirements.
 
 Run `scripts/kkkk_export.py` from the FreekiCAD directory. The actual FreeCAD
@@ -161,6 +159,8 @@ source object in the current FreeCAD document.
 The following video demonstrates coupler-based alignment:
 
 https://github.com/user-attachments/assets/c20a8d80-be67-4816-9a69-82f348ab255e
+
+![Coupler-Arguments](https://github.com/buganini/Kikakuka/blob/main/screenshots/coupler-args.png)
 
 See the [coupler-alignment screenshots][coupler-screenshots] for the key steps.
 
