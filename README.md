@@ -8,23 +8,44 @@ PCB editing and mechanical assembly.
 FreekiCAD and Kikakuka discover each other on demand through local Unix sockets
 or Windows named pipes. No board, assembly, or usage data is sent to third
 parties. Kikakuka can find open FreeCAD documents and reuse an existing
-instance when opening a file; see [Instance Manager](https://github.com/buganini/Kikakuka/blob/main/doc/INSTANCE_MANAGER.md)
+instance when opening a file; see [Instance Manager](https://github.com/buganini/Kikakuka/blob/main/im/README.md)
 for details.
 
-> [!CAUTION]
-> Due to [KiCad issue #23994](https://gitlab.com/kicad/code/kicad/-/work_items/23994), only one KiCad instance can currently be accessed through the IPC API on Windows.
+> [!NOTE]
+> Affected Windows builds expose only one IPC endpoint for multiple instances
+> due to [KiCad issue #23994](https://gitlab.com/kicad/code/kicad/-/work_items/23994).
+> Close all running KiCad applications before first using Kikakuka or
+> FreekiCAD. Instance Manager creates a persistent filesystem sentinel that
+> makes subsequently launched instances use PID-specific named pipes.
+>
+> With an older Kikakuka or FreekiCAD release, close all KiCad applications,
+> create the `%TEMP%\kicad` directory if it does not exist, and create an empty
+> regular file named `%TEMP%\kicad\api.sock`. Leave this sentinel file in place
+> for future KiCad launches.
 
 ![Bending+Assembly](https://github.com/buganini/Kikakuka/raw/main/screenshots/freekicad_bending_assembly.png)
 
 ## Features
 
-- Opening, importing, or dragging external `.kicad_pcb` files as linked PCB objects
-- Editing board outlines
-- Importing solid stiffeners from annotated `F.Stiffener` and `B.Stiffener` layers
+- Opening, importing, or dragging external `.kicad_pcb` files as linked PCB
+  objects with automatic source reload
+- Adding reloadable linked STEP objects
+- Editing board outlines and synchronizing component placement changes back to
+  KiCad
+- Optionally importing copper, solder mask, and silkscreen display layers
+- Importing solid stiffeners from annotated `F.Stiffener` and `B.Stiffener`
+  layers
 - Bending flexible PCBs from a KiCad user layer named `FreekiCAD`
-- Automatically aligning linked PCBs with KiCad coupler footprints
-- Assembling multiple linked PCBs and STEP models
-- Importing and exporting `.kkkk_asm` assembly files
+- Automatically aligning linked PCBs with matching `CouplerFixed` and
+  `CouplerMoving` footprints or an absolute `CouplerAt`
+- Assembling linked PCBs and STEP models with FreeCAD Assembly, Manipulator,
+  or direct transforms
+- Importing and exporting portable `.kkkk_asm` assembly manifests, including
+  flattened FreeCAD Assembly and `App::Link` placements
+- Exporting `.kkkk_asm` assemblies or individual `.kicad_pcb` boards to STEP
+  with `freecadcmd`
+- Running independently of the Kikakuka main program through the local
+  per-process Instance Manager mesh
 
 Both `.kicad_pcb` boards and STEP models remain linked to their external source
 files. When an assembly is saved as an `.FCStd` document, that document caches
@@ -163,7 +184,7 @@ The following video demonstrates coupler-based alignment:
 
 https://github.com/user-attachments/assets/c20a8d80-be67-4816-9a69-82f348ab255e
 
-![Coupler-Arguments](https://github.com/buganini/Kikakuka/blob/main/screenshots/coupler-args.png)
+![Coupler-Arguments](https://github.com/buganini/Kikakuka/raw/main/screenshots/coupler-args.png)
 
 See the [coupler-alignment screenshots][coupler-screenshots] for the key steps.
 
@@ -185,6 +206,11 @@ A PCB may use only one positioning source: one `CouplerMoving` or one
 recalculated in dependency order after linked boards reload and uses the
 coupler planes after flexible-PCB bending.
 
+FreekiCAD treats `CouplerFixed`, `CouplerMoving`, and `CouplerAt` as
+positioning markers and does not import any 3D models attached to those
+footprints. This keeps the optional KiCad 3D Viewer helper models out of the
+FreeCAD assembly.
+
 The plane is defined by the footprint position, board side, rotation, and
 custom footprint properties:
 
@@ -194,8 +220,8 @@ custom footprint properties:
   back side.
 - `Offset` moves the plane origin on the PCB surface in the direction shown by
   the footprint triangle. Both `Z` and `Offset` default to `0 mm`; unitless
-  values are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um` are
-  supported.
+  values are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um`/`µm`
+  are supported.
 - `Tilt` rotates the plane around its local X axis, in degrees, and defaults
   to `0`. Placement applies the footprint pose, `Offset`, `Z`, then `Tilt`;
   the tilt axis passes through the offset origin and does not redirect either
@@ -203,7 +229,8 @@ custom footprint properties:
 
 `CouplerAt` also has `TargetX`, `TargetY`, and `TargetZ` properties for its
 absolute FreeCAD world target. All three default to `0 mm`; unitless values
-are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um` are supported.
+are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um`/`µm` are
+supported.
 It has no local `Z` property. B.Cu is recommended for the usual bottom-surface
 placement at `TargetZ`; use F.Cu only to reference the top surface.
 
@@ -221,7 +248,7 @@ Adding or removing couplers, or changing their identity, takes
 effect after reloading the PCB.
 
 The footprints are available in Kikakuka's
-[`kicad-addon` directory][coupler-library].
+[`kicad-addon/library` directory][coupler-library].
 
 ## Flexible PCB Stiffener
 
@@ -317,7 +344,7 @@ This repository is a release mirror. Development takes place in the
 [FreekiCAD directory of the Kikakuka repository][upstream].
 
 [upstream]: https://github.com/buganini/Kikakuka/tree/main/FreekiCAD
-[coupler-library]: https://github.com/buganini/Kikakuka/tree/main/kicad-addon
+[coupler-library]: https://github.com/buganini/Kikakuka/tree/main/kicad-addon/library
 [coupler-screenshots]: https://github.com/buganini/Kikakuka/tree/main#coupler-based-pcb-alignment
 [fpc-assembly-example]: https://github.com/buganini/Kikakuka/blob/main/samples/fpc-assembly.kkkk_asm
 [fpc-sample]: https://github.com/buganini/Kikakuka/blob/main/samples/fpc.kicad_pcb
