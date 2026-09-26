@@ -47,6 +47,22 @@ for details.
 - Running independently of the Kikakuka main program through the local
   per-process Instance Manager mesh
 
+## Independent Instance Manager deployment
+
+FreekiCAD is packaged and deployed independently from the Kikakuka application.
+Its release contains regular package-local copies of the shared Instance
+Manager modules (`im_mesh.py`, `im_transport.py`, `instance_backend.py`, and
+`kicad_api_retry.py`) plus `kicad_paths.py`; it never imports Kikakuka-root
+modules at runtime. Every FreeCAD process starts its node when the FreekiCAD
+package is imported, including FreeCADCmd, so KiCad PCB operations do not
+require the Workspace Manager.
+
+When a FreekiCAD request resolves or opens a KiCad PCB, its mesh event carries
+the verified editor PID and full IPC socket path. A concurrently running
+Kikakuka Instance Manager therefore updates the row and displayed socket
+basename automatically. Process discovery and socket inspection remain limited
+to current-user editor processes.
+
 Both `.kicad_pcb` boards and STEP models remain linked to their external source
 files. When an assembly is saved as an `.FCStd` document, that document caches
 the generated objects and geometry while retaining each source path so the
@@ -71,7 +87,14 @@ linked STEP object is wanted.
 
 ## Manual Installation
 
-FreekiCAD requires FreeCAD 1.0 or later and `psutil>=5.9`
+You can install FreekiCAD from Kikakuka's **Add-ons** tab, which installs
+FreekiCAD and its required Python dependencies together. Kikakuka release
+builds already contain the addon package. When running Kikakuka from source,
+generate the packages with
+`python3 build_addon_archives.py` (or `make archive-zips`) before using its
+Add-ons tab.
+
+FreekiCAD requires FreeCAD 1.0 or later and `psutil>=7.2.2`
 for instance discovery and FreeCAD document-state publication. KiCad PCB
 integration additionally requires KiCad 9.0 or later plus
 `kicad-python>=0.8,<0.9` and `shapely>=2.0.7`; these two packages are optional
@@ -79,14 +102,20 @@ for STEP-only workflows. FreeCAD Addon Manager may not automatically install
 `psutil` where its allowed-package list excludes it; install
 it manually inside FreeCAD if necessary.
 
-After copying the `FreekiCAD` folder into FreeCAD's `Mod` folder, open **View >
-Panels > Python Console** and install `psutil`. For full KiCad
-integration, this single line also installs the KiCad extras. It waits for pip
-to finish, then prints its output:
+For a fully manual installation:
 
-```python
-import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys.executable),"python"),"-m","pip","install","kicad-python>=0.8,<0.9","shapely>=2.0.7","psutil>=5.9"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout)
-```
+1. Open **View > Panels > Python Console** in FreeCAD.
+2. Run `print(os.path.join(App.getUserAppDataDir(), "Mod"))` to find the addon
+   installation directory.
+3. Create the `Mod` directory if it does not exist, then copy the `FreekiCAD`
+   folder into it.
+4. Install `psutil` inside FreeCAD. For full KiCad integration, this single
+   line also installs the KiCad extras. It waits for pip to finish, then prints
+   its output:
+
+   ```python
+   import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys.executable),"python"),"-m","pip","install","kicad-python>=0.8,<0.9","shapely>=2.0.7","psutil>=7.2.2"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout)
+   ```
 
 ## Headless STEP Export
 

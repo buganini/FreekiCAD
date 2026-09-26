@@ -7,20 +7,26 @@ import stat
 import subprocess
 import tempfile
 import time
+from weakref import WeakKeyDictionary
 
 import psutil
 
-from .im_mesh import (activate_open_freecad_document, bind_freecad_source, launch_lock,
-                      local_node, open_in_freecad_node)
+from .kicad_compat import KICAD10_COMPAT, get_kicad_compat
+from .im_mesh import (activate_open_freecad_document, bind_freecad_source,
+                      is_kicad_editor_process, launch_lock, local_node,
+                      open_in_freecad_node, owned_pid_exists, owned_process,
+                      owned_process_iter)
 
 
-EDITOR_NAMES = ("kicad", "pcbnew", "eeschema", "pcb editor")
 FREECAD_SUFFIXES = (".fcstd", ".step", ".stp", ".kkkk_asm")
 FRESH_READY_RETRIES = 12
 FRESH_READY_DELAY_S = 0.25
+SOCKET_OWNER_RETRIES = 4
+SOCKET_OWNER_RETRY_DELAY_S = 0.1
 WINDOWS_KICAD_API_SENTINEL = (
     b"Kikakuka KiCad IPC compatibility sentinel for issue #23994.\r\n"
 )
+_BOARD_COMPATIBILITY = WeakKeyDictionary()
 
 
 def _normal(path):
@@ -70,10 +76,14 @@ if platform.system() == "Windows":
 def _editors(program="kicad"):
     editors = {}
     try:
-        for process in psutil.process_iter(["pid", "name", "create_time"]):
+        for process in owned_process_iter(["pid", "name", "create_time"]):
             try:
                 name = (process.info["name"] or "").lower()
-                match = (name.startswith("freecad") and not name.startswith("freecadcmd")) if program == "freecad" else any(token in name for token in EDITOR_NAMES)
+                match = (
+                    name.startswith("freecad") and not name.startswith("freecadcmd")
+                    if program == "freecad"
+                    else is_kicad_editor_process(name)
+                )
                 if match:
                     editors[process.pid] = process.info.get("create_time") or 0
             except (psutil.Error, OSError):
@@ -81,6 +91,101 @@ def _editors(program="kicad"):
     except (psutil.Error, OSError):
         pass
     return editors
+
+
+def _unix_socket_owner(
+        socket_path, editors, excluded_pids=(),
+        max_retries=SOCKET_OWNER_RETRIES,
+        delay_s=SOCKET_OWNER_RETRY_DELAY_S):
+    """Return the same-user editor PID that owns a Unix socket path."""
+    if platform.system() == "Windows" or not hasattr(os, "geteuid"):
+        return None
+
+    target = _normal(socket_path)
+    excluded_pids = set(excluded_pids)
+    candidates = [
+        pair for pair in sorted(editors.items(), key=lambda pair: pair[1])
+        if pair[0] not in excluded_pids
+    ]
+    for attempt in range(max_retries + 1):
+        for pid, expected_create_time in candidates:
+            try:
+                process = owned_process(pid, expected_create_time)
+                if process is None:
+                    continue
+                connections = process.net_connections(kind="unix")
+            except (psutil.Error, OSError, RuntimeError, NotImplementedError):
+                continue
+            for connection in connections:
+                local_address = connection.laddr
+                if (isinstance(local_address, str) and local_address
+                        and _normal(local_address) == target):
+                    return pid
+        if candidates and attempt < max_retries:
+            time.sleep(delay_s)
+    return None
+
+
+def _windows_named_pipe_server_pid(pipe_path):
+    """Return a named pipe's server PID via Kernel32, or None on failure."""
+    if platform.system() != "Windows" or not pipe_path:
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        get_server_pid = kernel32.GetNamedPipeServerProcessId
+        get_server_pid.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        get_server_pid.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(pipe_path, 0, 0, None, 3, 0, None)
+        if handle == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            pid = wintypes.ULONG()
+            if not get_server_pid(handle, ctypes.byref(pid)):
+                return None
+            return int(pid.value)
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_named_pipe_owner(pipe_path, editors, excluded_pids=()):
+    """Return the validated same-user editor PID serving a named pipe."""
+    if platform.system() != "Windows" or not pipe_path:
+        return None
+
+    try:
+        pid = _windows_named_pipe_server_pid(pipe_path)
+        if pid is None or pid in excluded_pids or pid not in editors:
+            return None
+        expected_create_time = editors[pid]
+        if owned_process(pid, expected_create_time) is None:
+            return None
+        return pid
+    except (psutil.Error, OSError, RuntimeError):
+        return None
 
 
 def _sockets():
@@ -92,6 +197,7 @@ def _sockets():
         names = os.listdir(directory)
     except OSError:
         names = []
+    windows_pipe_paths = {}
     if is_windows:
         # KiCad/nng exposes endpoints as named pipes instead of directory
         # entries. Keep the canonical ipc:// filesystem-style path for kipy.
@@ -99,6 +205,9 @@ def _sockets():
             for pipe in os.listdir(r"\\.\pipe"):
                 for candidate in re.findall(r"api(?:-\d+)?\.sock", pipe):
                     names.append(candidate)
+                    windows_pipe_paths.setdefault(
+                        candidate, rf"\\.\pipe\{pipe}"
+                    )
         except OSError:
             pass
     editors = _editors()
@@ -111,8 +220,20 @@ def _sockets():
         elif name == "api.sock":
             generic = os.path.join(directory, name)
     if generic:
-        candidate = next((pid for pid, _ in sorted(editors.items(), key=lambda pair: pair[1])
-                          if pid not in explicit), None)
+        if is_windows:
+            pipe_path = windows_pipe_paths.get("api.sock")
+            candidate = (
+                _windows_named_pipe_owner(
+                    pipe_path, editors, set(explicit)
+                ) if pipe_path else None
+            )
+        else:
+            candidate = _unix_socket_owner(
+                generic, editors, set(explicit)
+            )
+        if candidate is None:
+            candidate = next((pid for pid, _ in sorted(editors.items(), key=lambda pair: pair[1])
+                              if pid not in explicit), None)
         if candidate is not None:
             explicit[candidate] = generic
     return list(explicit.items())
@@ -122,23 +243,34 @@ def _ready_board(socket_path, max_retries=0, delay_s=1.0):
     from kipy.kicad import KiCad
     from .kicad_api_retry import get_ready_kicad_board
 
-    return get_ready_kicad_board(
-        KiCad(socket_path=f"ipc://{socket_path}", timeout_ms=1000),
+    kicad = KiCad(socket_path=f"ipc://{socket_path}", timeout_ms=1000)
+    board = get_ready_kicad_board(
+        kicad,
         max_retries=max_retries,
         delay_s=delay_s,
         retry_connection_timeout=True,
     )
+    compatibility = get_kicad_compat(kicad.get_version())
+    try:
+        _BOARD_COMPATIBILITY[board] = compatibility
+        board._kikakuka_compatibility = compatibility
+    except TypeError:
+        try:
+            board._kikakuka_compatibility = compatibility
+        except (AttributeError, TypeError):
+            pass
+    return board
 
 
 def _board_path_from_ready_board(board):
-    name = getattr(board, "name", "") or getattr(getattr(board, "document", None), "board_filename", "")
-    if not name:
-        return None
-    if os.path.isabs(name):
-        return _normal(name)
-    project = board.get_project()
-    project_path = getattr(project, "path", "")
-    return _normal(os.path.join(project_path, name)) if project_path else None
+    try:
+        compatibility = _BOARD_COMPATIBILITY.get(board)
+    except TypeError:
+        compatibility = None
+    if compatibility is None:
+        compatibility = getattr(board, "__dict__", {}).get(
+            "_kikakuka_compatibility", KICAD10_COMPAT)
+    return compatibility.board_path(board, _normal)
 
 
 def _board_path(socket_path):
@@ -161,7 +293,7 @@ def _find_board(filepath, wait_until_ready=False):
 
 
 def scan_open_kicad_boards():
-    """Read open PCB paths from live KiCad IPC endpoints for the UI inventory."""
+    """Read open PCB paths and sockets from live KiCad IPC endpoints."""
     boards = []
     for pid, socket_path in _sockets():
         try:
@@ -169,11 +301,13 @@ def scan_open_kicad_boards():
         except Exception:
             continue
         if filepath:
-            boards.append((pid, filepath))
+            boards.append((pid, filepath, socket_path))
     return boards
 
 
 def _focus(pid):
+    if not owned_pid_exists(pid):
+        return
     if platform.system() == "Darwin":
         try:
             subprocess.run(["osascript", "-e", f'tell application "System Events" to set frontmost of (first process whose unix id is {int(pid)}) to true'],
@@ -276,7 +410,7 @@ def _open_new(filepath, program, is_board, node, ensure_fresh=False):
                 return pid, None
         elif node is not None:
             pid = node.snapshot().get(filepath)
-            if pid is not None and psutil.pid_exists(pid):
+            if pid is not None and owned_pid_exists(pid):
                 return pid, None
 
         if program == "freecad" and _editors("freecad"):
@@ -329,7 +463,8 @@ def handle(request):
         # A live PID alone does not prove that the editor still has this
         # board open. The KiCad API's filename is authoritative.
         node.publish(filepath, None)
-    if pid is None and mapped and psutil.pid_exists(mapped) and not is_board and not is_freecad:
+    if (pid is None and mapped and owned_pid_exists(mapped)
+            and not is_board and not is_freecad):
         pid = mapped
     if pid is None and action == "monitor-couplers":
         return {"status": "error", "message": "file is not open in KiCad"}
@@ -345,13 +480,18 @@ def handle(request):
         if ensure_fresh and board is not None:
             _revert_ready_board(board)
         _focus(pid)
-        return {"status": "ok", "action": action, "filepath": filepath, "pid": pid}
+        reply = {
+            "status": "ok", "action": action, "filepath": filepath, "pid": pid,
+        }
+        if socket_path:
+            reply["socket"] = socket_path
+        return reply
 
     if not is_board:
         return {"status": "error", "message": "KiCad IPC requires a PCB file"}
     deadline = time.monotonic() + 30
     while socket_path is None and time.monotonic() < deadline:
-        if not psutil.pid_exists(pid):
+        if not owned_pid_exists(pid):
             return {"status": "error", "message": "KiCad editor exited before IPC was ready"}
         time.sleep(0.5)
         verified_pid, socket_path, _board = _find_board(filepath)
