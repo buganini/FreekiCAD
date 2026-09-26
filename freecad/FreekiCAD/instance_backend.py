@@ -1,12 +1,17 @@
 """KiCad editor operations shared by Kikakuka and FreekiCAD mesh nodes."""
 
+import getpass
+import json
 import os
 import platform
 import re
+import shutil
+import socket
 import stat
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from weakref import WeakKeyDictionary
 
 import psutil
@@ -91,6 +96,68 @@ def _editors(program="kicad"):
     except (psutil.Error, OSError):
         pass
     return editors
+
+
+def _windows_associated_executable(extension):
+    """Return the executable registered for a Windows file extension."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        query = ctypes.windll.shlwapi.AssocQueryStringW
+        query.argtypes = (
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        query.restype = wintypes.LONG
+        length = wintypes.DWORD()
+        # ASSOCSTR_EXECUTABLE = 2
+        query(0, 2, extension, None, None, ctypes.byref(length))
+        if not length.value:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        if query(0, 2, extension, None, buffer, ctypes.byref(length)) != 0:
+            return None
+        return Path(buffer.value) if buffer.value else None
+    except (AttributeError, OSError):
+        return None
+
+
+def _windows_freecad_executable():
+    """Find the FreeCAD GUI without relying on a FreekiCAD file association."""
+    candidates = []
+    associated = _windows_associated_executable(".FCStd")
+    if associated:
+        candidates.append(associated)
+    for name in ("FreeCAD.exe", "freecad.exe"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    for root in filter(None, (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramW6432"),
+            os.environ.get("LOCALAPPDATA"))):
+        candidates.extend(sorted(
+            Path(root).glob("FreeCAD*/bin/FreeCAD.exe"), reverse=True))
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except OSError:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _unix_socket_owner(
@@ -340,6 +407,47 @@ def _focus(pid):
             pass
 
 
+def freecad_process_environment(executable):
+    """Run FreeCAD with its own Python/Qt, not the launching KiCad runtime."""
+    environment = os.environ.copy()
+    for name in (
+        "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
+        "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QML_IMPORT_PATH", "QML2_IMPORT_PATH",
+    ):
+        environment.pop(name, None)
+    # FreeCAD explicitly adds its AdditionalPythonPackages directory itself.
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PATH"] = str(Path(executable).parent) + os.pathsep + environment.get("PATH", "")
+    return environment
+
+
+def _windows_open_kicad_background(filepath):
+    """Open an associated KiCad file without activating its new window."""
+    try:
+        os.startfile(filepath, show_cmd=4)  # SW_SHOWNOACTIVATE
+    except TypeError:
+        # ``show_cmd`` was added after Python 3.9. Keep source runs on older
+        # embedded Python versions background-capable without a dependency.
+        import ctypes
+        from ctypes import wintypes
+
+        shell_execute = ctypes.windll.shell32.ShellExecuteW
+        shell_execute.argtypes = (
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        )
+        shell_execute.restype = wintypes.HINSTANCE
+        result = shell_execute(None, "open", filepath, None, None, 4) or 0
+        if result <= 32:
+            raise OSError(
+                result, f"could not open associated KiCad file: {filepath}")
+
+
 def _launch(filepath, program="kicad"):
     if platform.system() == "Windows" and program == "kicad":
         ensure_windows_kicad_api_sentinel()
@@ -353,7 +461,11 @@ def _launch(filepath, program="kicad"):
         else:
             subprocess.Popen(["open", "-n", "-g", filepath])
     elif platform.system() == "Windows":
-        os.startfile(filepath)
+        freecad = _windows_freecad_executable() if program == "freecad" else None
+        if freecad:
+            subprocess.Popen([freecad, filepath], env=freecad_process_environment(freecad))
+        else:
+            _windows_open_kicad_background(filepath)
     else:
         subprocess.Popen(["xdg-open", filepath])
     deadline = time.monotonic() + (20 if program == "freecad" else 8)
@@ -375,6 +487,47 @@ def _wait_for_board(filepath, timeout=30):
             return pid, socket_path
         time.sleep(0.5)
     return None, None
+
+
+def _kicad_lock_path(filepath):
+    """Return KiCad's lock-file path for an editor document."""
+    path = Path(filepath)
+    return path.with_name(f"~{path.name}.lck")
+
+
+def _kicad_file_may_prompt_open_anyway(filepath):
+    """Whether KiCad may show its Open Anyway prompt for this file."""
+    lock_path = _kicad_lock_path(filepath)
+    try:
+        if not lock_path.is_file():
+            return False
+        with lock_path.open(encoding="utf-8") as lock_file:
+            owner = json.load(lock_file)
+        username = owner.get("username", "")
+        hostname = owner.get("hostname", "")
+        if not isinstance(username, str) or not isinstance(hostname, str):
+            username = hostname = ""
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        # KiCad treats an unreadable/partial cloud-sync record as its own stale
+        # lock, then only prompts when another KiCad process is running.
+        username = hostname = ""
+
+    try:
+        owned_by_current_user = (
+            (not username and not hostname)
+            or (
+                username.casefold() == getpass.getuser().casefold()
+                and hostname.casefold() == socket.gethostname().casefold()
+            )
+        )
+    except (KeyError, OSError):
+        return True
+    if owned_by_current_user:
+        return bool(_editors("kicad"))
+    try:
+        return lock_path.is_file()
+    except OSError:
+        return False
 
 
 def _revert_ready_board(board):
@@ -416,7 +569,17 @@ def _open_new(filepath, program, is_board, node, ensure_fresh=False):
         if program == "freecad" and _editors("freecad"):
             raise RuntimeError(
                 "FreeCAD is running but its FreekiCAD instance node is unavailable")
+        # Check before launching: KiCad creates this file itself during a
+        # normal open, so checking afterwards would flag every new editor.
+        may_prompt_open_anyway = (
+            program == "kicad"
+            and _kicad_file_may_prompt_open_anyway(filepath)
+        )
         pid = _launch(filepath, program)
+        if pid is not None and may_prompt_open_anyway:
+            # The modal prompt blocks IPC startup. Bring it forward before
+            # waiting for the board to become discoverable.
+            _focus(pid)
         if is_board:
             return _wait_for_board(filepath)
         if program == "freecad" and pid is not None:
