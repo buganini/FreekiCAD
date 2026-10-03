@@ -1,6 +1,7 @@
 """KiCad editor operations shared by Kikakuka and FreekiCAD mesh nodes."""
 
 import getpass
+import base64
 import json
 import os
 import platform
@@ -23,7 +24,7 @@ from .im_mesh import (activate_open_freecad_document, bind_freecad_source,
                       owned_process_iter)
 
 
-FREECAD_SUFFIXES = (".fcstd", ".step", ".stp", ".kkkk_asm")
+FREECAD_SUFFIXES = (".fcstd", ".step", ".stp", ".stl", ".kkkk_asm")
 FRESH_READY_RETRIES = 12
 FRESH_READY_DELAY_S = 0.25
 SOCKET_OWNER_RETRIES = 4
@@ -32,6 +33,32 @@ WINDOWS_KICAD_API_SENTINEL = (
     b"Kikakuka KiCad IPC compatibility sentinel for issue #23994.\r\n"
 )
 _BOARD_COMPATIBILITY = WeakKeyDictionary()
+
+_FREECAD_ENVIRONMENT_REMOVALS = (
+    "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
+    "PYTHONEXECUTABLE", "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT",
+    "__PYVENV_LAUNCHER__",
+    "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+    "QML_IMPORT_PATH", "QML2_IMPORT_PATH", "QT_QPA_FONTDIR",
+    "KICAD_API_TOKEN", "KICAD_API_SOCKET",
+    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_INSERT_LIBRARIES", "LD_LIBRARY_PATH", "LD_PRELOAD",
+)
+
+_SYSTEMD_FREECAD_ENVIRONMENT = {
+    "DBUS_SESSION_BUS_ADDRESS", "DESKTOP_SESSION", "DISPLAY",
+    "GTK_IM_MODULE", "HOME", "LANG", "LANGUAGE", "LOGNAME", "PATH",
+    "QT_ACCESSIBILITY", "QT_IM_MODULE", "USER", "WAYLAND_DISPLAY",
+    "XAUTHORITY", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+    "XDG_CURRENT_DESKTOP", "XDG_DATA_DIRS", "XDG_DATA_HOME",
+    "XDG_MENU_PREFIX", "XDG_RUNTIME_DIR", "XDG_SESSION_CLASS",
+    "XDG_SESSION_DESKTOP", "XDG_SESSION_TYPE", "PYTHONNOUSERSITE",
+}
+
+_SYSTEMD_FREECAD_ENVIRONMENT_PREFIXES = (
+    "GBM_", "GALLIUM_", "LC_", "LIBGL_", "MESA_", "VK_", "__GL_",
+)
 
 
 def _normal(path):
@@ -158,6 +185,124 @@ def _windows_freecad_executable():
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def _custom_executable(application):
+    """Read a launch override without depending on the Kikakuka package."""
+    try:
+        config = json.loads(
+            (Path.home() / ".kikakuka").read_text(encoding="utf-8")
+        )
+        value = config.get(f"{application}_executable")
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(value).expanduser()
+
+
+def _configured_gui_executable(program):
+    configured = _custom_executable(program)
+    if configured is None:
+        return None
+
+    candidates = []
+    name = configured.name.casefold()
+    command_only = program == "freecad" and name in {
+        "freecadcmd", "freecadcmd.exe", "freecad.cmd",
+    }
+    if platform.system() == "Darwin":
+        app = (
+            configured
+            if configured.suffix.casefold() == ".app" and configured.is_dir()
+            else next(
+                (parent for parent in configured.parents
+                 if parent.suffix.casefold() == ".app" and parent.is_dir()),
+                None,
+            )
+        )
+        if app is not None:
+            return str(app)
+
+    if command_only:
+        candidates.extend([
+            configured.with_name("freecad"),
+            configured.with_name("FreeCAD.exe"),
+            configured.with_name("FreeCAD"),
+        ])
+    elif program == "kicad" and name in {"kicad-cli", "kicad-cli.exe"}:
+        command_only = True
+        candidates.extend([
+            configured.with_name("pcbnew.exe"),
+            configured.with_name("pcbnew"),
+            configured.with_name("kicad.exe"),
+            configured.with_name("kicad"),
+        ])
+    if not command_only:
+        candidates.append(configured)
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def _linux_kicad_executable(filepath):
+    """Resolve the Linux KiCad editor for a supported design-file suffix."""
+    suffix = Path(filepath).suffix.casefold()
+    editor = {
+        ".kicad_pcb": "pcbnew",
+        ".kicad_sch": "eeschema",
+        ".kicad_pro": "kicad",
+    }.get(suffix)
+    if editor is None:
+        raise ValueError(f"unsupported KiCad file type: {filepath}")
+
+    configured = _custom_executable("kicad")
+    if configured is not None:
+        name = configured.name.casefold()
+        if (configured.suffix.casefold() == ".appimage" or
+                name not in {
+                    "kicad-cli", "kicad", "pcbnew", "eeschema",
+                }):
+            if configured.is_file():
+                return str(configured)
+        sibling = configured.with_name(editor)
+        if sibling.is_file():
+            return str(sibling)
+        raise FileNotFoundError(
+            f"The selected KiCad installation has no {editor} executable"
+        )
+
+    host_environment = external_process_environment()
+    search = {"path": host_environment.get("PATH", os.defpath)} if os.environ.get("KIKAKUKA_HOST_ENV") else {}
+    executable = shutil.which(editor, **search)
+    if executable:
+        return executable
+
+    cli = shutil.which("kicad-cli", **search)
+    if cli:
+        sibling = Path(cli).with_name(editor)
+        if sibling.is_file():
+            return str(sibling)
+    raise FileNotFoundError(
+        f"KiCad {editor} executable was not found in PATH"
+    )
+
+
+def _linux_kicad_environment(environ=None):
+    """Use XWayland for launched KiCad editors when it is available."""
+    environment = external_process_environment() if environ is None else dict(environ)
+    from .linux_window import xwayland_available
+
+    if xwayland_available(environment):
+        environment["GDK_BACKEND"] = "x11"
+    return environment
+
+
+def launch_linux_kicad(filepath):
+    """Launch a KiCad editor directly instead of using a file association."""
+    executable = _linux_kicad_executable(filepath)
+    return subprocess.Popen(
+        [executable, filepath],
+        env=_linux_kicad_environment(),
+    )
 
 
 def _unix_socket_owner(
@@ -310,7 +455,9 @@ def _ready_board(socket_path, max_retries=0, delay_s=1.0):
     from kipy.kicad import KiCad
     from .kicad_api_retry import get_ready_kicad_board
 
-    kicad = KiCad(socket_path=f"ipc://{socket_path}", timeout_ms=1000)
+    # The caller may have inherited another KiCad instance's API token.
+    # An empty initial token lets kipy learn the selected endpoint's token.
+    kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="", timeout_ms=1000)
     board = get_ready_kicad_board(
         kicad,
         max_retries=max_retries,
@@ -374,7 +521,7 @@ def scan_open_kicad_boards():
 
 def _focus(pid):
     if not owned_pid_exists(pid):
-        return
+        return None
     if platform.system() == "Darwin":
         try:
             subprocess.run(["osascript", "-e", f'tell application "System Events" to set frontmost of (first process whose unix id is {int(pid)}) to true'],
@@ -405,21 +552,134 @@ def _focus(pid):
                 user32.SetForegroundWindow(found[0])
         except (OSError, AttributeError):
             pass
+    elif platform.system() == "Linux":
+        from .linux_window import WindowActivationError, bring_pid_to_front
+
+        try:
+            if not bring_pid_to_front(pid):
+                return f"No visible X11 window was found for PID {pid}."
+        except WindowActivationError as exc:
+            return str(exc)
+    return None
 
 
-def freecad_process_environment(executable):
-    """Run FreeCAD with its own Python/Qt, not the launching KiCad runtime."""
+def external_process_environment():
+    """Restore the desktop environment captured before sharun changed it."""
     environment = os.environ.copy()
-    for name in (
-        "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
-        "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
-        "QML_IMPORT_PATH", "QML2_IMPORT_PATH",
-    ):
+    snapshot = environment.get("KIKAKUKA_HOST_ENV")
+    if snapshot:
+        try:
+            entries = base64.b64decode(snapshot, validate=True).split(b"\0")
+            restored = dict(os.fsdecode(entry).split("=", 1) for entry in entries if entry)
+            if "PATH" not in restored:
+                raise ValueError("AppImage host environment has no PATH")
+            environment = restored
+        except (ValueError, UnicodeError):
+            raise RuntimeError("Invalid AppImage host environment snapshot") from None
+        for name in list(environment):
+            if name in {"APPDIR", "APPIMAGE", "ARGV0", "OWD", "KIKAKUKA_HOST_ENV"} \
+                    or name.startswith(("SHARUN_", "URUNTIME_")):
+                environment.pop(name, None)
+    return environment
+
+
+def freecad_process_environment(executable=None):
+    """Run FreeCAD with its own Python/Qt, not the launching KiCad runtime."""
+    environment = external_process_environment()
+    for name in _FREECAD_ENVIRONMENT_REMOVALS:
         environment.pop(name, None)
     # FreeCAD explicitly adds its AdditionalPythonPackages directory itself.
     environment["PYTHONNOUSERSITE"] = "1"
-    environment["PATH"] = str(Path(executable).parent) + os.pathsep + environment.get("PATH", "")
+    if executable is not None:
+        environment["PATH"] = str(Path(executable).parent) + os.pathsep + environment.get("PATH", "")
     return environment
+
+
+def freecad_launch_log_path():
+    """Return the per-user log used by detached Linux FreeCAD launches."""
+    if hasattr(os, "getuid"):
+        scope = str(os.getuid())
+    else:
+        scope = getpass.getuser()
+    return Path(tempfile.gettempdir()) / f"kikakuka-{scope}" / "freecad-startup.log"
+
+
+def _systemd_freecad_environment(environment):
+    """Return non-secret desktop variables needed by a transient user unit."""
+    return {
+        name: value for name, value in environment.items()
+        if name in _SYSTEMD_FREECAD_ENVIRONMENT
+        or name.startswith(_SYSTEMD_FREECAD_ENVIRONMENT_PREFIXES)
+    }
+
+
+def _systemd_run_freecad(command, environment, log_path):
+    """Ask the Linux user manager to own FreeCAD independently of KiCad."""
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run or not environment.get("DBUS_SESSION_BUS_ADDRESS") \
+            or not environment.get("XDG_RUNTIME_DIR"):
+        return None
+
+    unit = f"kikakuka-freecad-{os.getpid()}-{time.monotonic_ns()}"
+    invocation = [
+        systemd_run,
+        "--user",
+        "--collect",
+        "--quiet",
+        "--service-type=exec",
+        f"--unit={unit}",
+        f"--working-directory={Path.home()}",
+        "--property=KillMode=process",
+        "--property=PrivateTmp=no",
+        f"--property=StandardOutput=append:{log_path}",
+        f"--property=StandardError=append:{log_path}",
+        "--property=UnsetEnvironment=" + " ".join(
+            _FREECAD_ENVIRONMENT_REMOVALS
+        ),
+    ]
+    for name, value in sorted(_systemd_freecad_environment(environment).items()):
+        invocation.append(f"--setenv={name}={value}")
+    invocation.extend(("--", *command))
+    try:
+        completed = subprocess.run(
+            invocation,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed if completed.returncode == 0 else None
+
+
+def _popen_freecad(command, executable=None):
+    """Launch FreeCAD without tying its lifetime to a KiCad action process."""
+    environment = freecad_process_environment(executable)
+    kwargs = {"env": environment}
+    if platform.system() != "Linux":
+        return subprocess.Popen(command, **kwargs)
+
+    log_path = freecad_launch_log_path()
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log_path.write_bytes(b"")
+    systemd_launch = _systemd_run_freecad(command, environment, log_path)
+    if systemd_launch is not None:
+        return systemd_launch
+
+    with log_path.open("wb") as output:
+        return subprocess.Popen(
+            command,
+            cwd=Path.home(),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            **kwargs,
+        )
 
 
 def _windows_open_kicad_background(filepath):
@@ -452,22 +712,56 @@ def _launch(filepath, program="kicad"):
     if platform.system() == "Windows" and program == "kicad":
         ensure_windows_kicad_api_sentinel()
     before = _editors(program)
-    if platform.system() == "Darwin":
+    configured = _configured_gui_executable(program)
+    configured_app = (
+        configured
+        and platform.system() == "Darwin"
+        and Path(configured).suffix == ".app"
+    )
+    if platform.system() == "Linux" and program == "kicad":
+        launch_linux_kicad(filepath)
+    elif configured_app and program == "freecad":
+        _popen_freecad(
+            ["open", "-a", configured, "-n", "-W", "--args"]
+            + ([filepath] if filepath else []),
+        )
+    elif configured_app:
+        subprocess.Popen(
+            ["open", "-a", configured, "-n", "-g"]
+            + ([filepath] if filepath else []),
+        )
+    elif configured:
+        command = [configured] + ([filepath] if filepath else [])
+        if program == "freecad":
+            _popen_freecad(command, configured)
+        else:
+            subprocess.Popen(command)
+    elif platform.system() == "Darwin":
         if program == "freecad":
             # FreeCAD on macOS does not reliably handle Finder's open-file
             # event. Pass the path as an application argument, as the former
             # Workspace Manager launcher did.
-            subprocess.Popen(["open", "-a", "FreeCAD", "-n", "-W", "--args", filepath])
+            _popen_freecad(["open", "-a", "FreeCAD", "-n", "-W", "--args"]
+                           + ([filepath] if filepath else []))
         else:
             subprocess.Popen(["open", "-n", "-g", filepath])
     elif platform.system() == "Windows":
         freecad = _windows_freecad_executable() if program == "freecad" else None
         if freecad:
-            subprocess.Popen([freecad, filepath], env=freecad_process_environment(freecad))
+            _popen_freecad([freecad] + ([filepath] if filepath else []), freecad)
+        elif program == "freecad":
+            raise FileNotFoundError("FreeCAD executable was not found")
         else:
             _windows_open_kicad_background(filepath)
+    elif program == "freecad":
+        freecad = shutil.which("FreeCAD") or shutil.which("freecad")
+        if not freecad:
+            raise FileNotFoundError("FreeCAD executable was not found in PATH")
+        _popen_freecad([freecad] + ([filepath] if filepath else []), freecad)
     else:
-        subprocess.Popen(["xdg-open", filepath])
+        raise RuntimeError(
+            f"Unsupported {program} launch platform: {platform.system()}"
+        )
     deadline = time.monotonic() + (20 if program == "freecad" else 8)
     while time.monotonic() < deadline:
         after = _editors(program)
@@ -642,12 +936,15 @@ def handle(request):
     if action == "open-file":
         if ensure_fresh and board is not None:
             _revert_ready_board(board)
-        _focus(pid)
+        activation_error = _focus(pid)
         reply = {
             "status": "ok", "action": action, "filepath": filepath, "pid": pid,
         }
         if socket_path:
             reply["socket"] = socket_path
+        if activation_error:
+            reply["activation_error"] = activation_error
+            reply["message"] = activation_error
         return reply
 
     if not is_board:

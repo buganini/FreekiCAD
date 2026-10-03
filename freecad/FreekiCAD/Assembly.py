@@ -1,7 +1,7 @@
 """Import and export FreekiCAD assembly manifests.
 
 ``.kkkk_asm`` files are deliberately plain JSON.  They reference KiCad boards
-and STEP models instead of embedding generated FreeCAD geometry, which keeps
+and external models instead of embedding generated FreeCAD geometry, which keeps
 the files small and lets each linked object rebuild through its normal path.
 """
 
@@ -27,6 +27,10 @@ PCB_OBJECT_SETTINGS = (
     "DebugBoard",
     "WedgeMode",
 )
+MODEL_OBJECT_SETTINGS = {
+    "StepObject": ("AutoReload",),
+    "StlObject": ("AutoReload", "LengthPerUnit"),
+}
 
 
 class _ExportInstance:
@@ -130,7 +134,7 @@ def _is_supported_object(obj):
     if str(getattr(obj, "TypeId", "") or "") in (
             "App::Link", "App::LinkElement"):
         return False
-    return _object_type(obj) in ("PcbObject", "StepObject")
+    return _object_type(obj) in ("PcbObject", *MODEL_OBJECT_SETTINGS)
 
 
 def _is_link(obj):
@@ -285,12 +289,18 @@ def _object_to_json(instance, filename, assembly_objects):
         )
     settings = {}
     setting_names = (PCB_OBJECT_SETTINGS if object_type == "PcbObject"
-                     else ("AutoReload",))
+                     else MODEL_OBJECT_SETTINGS[object_type])
     for name in setting_names:
         if not hasattr(obj, name):
             continue
         value = getattr(obj, name)
-        settings[name] = str(value) if name == "WedgeMode" else bool(value)
+        if name == "WedgeMode":
+            settings[name] = str(value)
+        elif name == "LengthPerUnit":
+            settings["LengthPerUnitMM"] = float(
+                value.getValueAs("mm").Value)
+        else:
+            settings[name] = bool(value)
     if instance.snapshot and object_type == "PcbObject":
         # An Assembly/App::Link export is a flattened pose snapshot.  Do not
         # let coupler positioning overwrite that solved instance placement
@@ -304,7 +314,7 @@ def _object_to_json(instance, filename, assembly_objects):
     # CouplerMoving placement is derived state.  Omitting it avoids briefly
     # restoring a stale transform before the linked boards finish loading.
     if (instance.snapshot
-            or object_type == "StepObject"
+            or object_type in MODEL_OBJECT_SETTINGS
             or not _uses_moving_coupler(obj, assembly_objects)):
         data["placement"] = _placement_to_json(instance.placement)
     return data
@@ -353,7 +363,7 @@ def insert(filename, document_name, recompute=True):
     imported = []
     for index, item in enumerate(data["objects"]):
         if not isinstance(item, dict) or item.get("type") not in (
-                "PcbObject", "LinkedObject", "StepObject"):
+                "PcbObject", "LinkedObject", *MODEL_OBJECT_SETTINGS):
             raise ValueError("object {} has an unsupported type".format(index))
         source = item.get("file")
         if not isinstance(source, str) or not source:
@@ -364,17 +374,36 @@ def insert(filename, document_name, recompute=True):
 
             obj = create_pcb_object(document=document, recompute=False)
             setting_names = PCB_OBJECT_SETTINGS
-        else:
+        elif item["type"] == "StepObject":
             from .StepObject import create_step_object
 
             obj = create_step_object(document=document, recompute=False)
-            setting_names = ("AutoReload",)
+            setting_names = MODEL_OBJECT_SETTINGS["StepObject"]
+        else:
+            from .StlObject import create_stl_object
+
+            obj = create_stl_object(document=document, recompute=False)
+            setting_names = MODEL_OBJECT_SETTINGS["StlObject"]
         settings = item.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError("object {} settings must be an object".format(index))
+        if item["type"] == "StlObject" and "UnitScale" in settings:
+            raise ValueError(
+                "object {} uses obsolete UnitScale; use "
+                "LengthPerUnitMM".format(index))
         for name in setting_names:
-            if name in settings and hasattr(obj, name):
-                setattr(obj, name, settings[name])
+            setting_name = (
+                "LengthPerUnitMM" if name == "LengthPerUnit" else name)
+            if setting_name not in settings or not hasattr(obj, name):
+                continue
+            value = settings[setting_name]
+            if name == "LengthPerUnit":
+                if isinstance(value, bool) or not isinstance(
+                        value, (int, float)) or value <= 0:
+                    raise ValueError(
+                        "object {} LengthPerUnitMM must be a positive "
+                        "number".format(index))
+            setattr(obj, name, value)
         if "placement" in item:
             obj.Placement = _placement_from_json(item["placement"])
         # Set the filename last so PcbObject sees all restored settings when
@@ -394,4 +423,7 @@ def open(filename):
     insert(filename, document.Name)
     from .im_client import register_document_source
     register_document_source(document, filename)
+    if getattr(FreeCAD, "GuiUp", False):
+        from .im_client import activate_gui_document
+        activate_gui_document(document)
     return document

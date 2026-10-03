@@ -3,6 +3,7 @@ import math
 import json
 import re
 import time
+from contextlib import contextmanager
 import FreeCAD
 import Part
 
@@ -14,7 +15,7 @@ from .kicad_paths import (
 )
 from .StepLoader import (
     _insert_step_merged,
-    _load_step,
+    _load_model,
     _write_face_colors,
 )
 from .Units import parse_length_mm
@@ -25,7 +26,7 @@ DEFAULT_PCB_THICKNESS = 1.6  # mm fallback
 GEOMETRY_TOLERANCE = 0.001  # mm (1 µm)
 PARTITION_RELATIVE_TOLERANCE = 1e-6
 BEND_ANNOTATION_POSITION_TOLERANCE = 0.1  # mm
-STEP_IMPORTER_REVISION = 1
+STEP_IMPORTER_REVISION = 2
 COPPER_STRAIN_WARNING = 0.05
 
 COUPLER_MOVING = "CouplerMoving"
@@ -35,10 +36,34 @@ COUPLER_FIXED_COLOR = (1.0, 0.1, 0.1)
 COUPLER_MOVING_COLOR = (1.0, 0.4, 0.1)
 _COUPLER_TYPES = {COUPLER_MOVING, COUPLER_FIXED, COUPLER_AT}
 COUPLER_MONITOR_INTERVAL_MS = 1000
+COUPLER_MONITOR_RETRY_INITIAL_S = 5.0
+COUPLER_MONITOR_RETRY_MAX_S = 20.0
 PCB_OBJECT_TYPES = {"PcbObject", "LinkedObject"}
 # Master switch for coupler synchronization in both directions.
 # Local FreeCAD marker editing and coupled-board positioning remain active.
 COUPLER_KICAD_SYNC_ENABLED = True
+
+
+@contextmanager
+def _pcb_import_status(obj):
+    """Paint a busy indication without pumping callbacks during an import."""
+    status_bar = None
+    if getattr(FreeCAD, 'GuiUp', False):
+        import FreeCADGui
+        from PySide import QtWidgets, QtCore
+        status_bar = FreeCADGui.getMainWindow().statusBar()
+        previous_message = status_bar.currentMessage()
+        message = f"Importing PCB {obj.Label}; complex bends may take a while..."
+        status_bar.showMessage(message)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        status_bar.repaint()
+    try:
+        yield
+    finally:
+        if status_bar is not None:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            if status_bar.currentMessage() == message:
+                status_bar.showMessage(previous_message)
 
 
 def _outer_body_bounds(thickness, layer_groups):
@@ -659,16 +684,20 @@ def _parse_bend_annotation(text_val, thickness):
     if m_a:
         angle = float(m_a.group(1))
 
-    m_r = re.search(r'r\s*=\s*' + _BEND_ANNOTATION_NUMBER_RE, text_val)
+    # Capture the entire quantity, including unknown suffixes, so invalid
+    # units fail instead of silently treating e.g. 100um as 100 millimetres.
+    # A following annotation key (a=, r=, s=) is not a spaced unit suffix.
+    quantity = r'([^\s,;]+(?:\s+(?![A-Za-z]+\s*=)[A-Za-zµμ]+)?)'
+    m_r = re.search(r'(?<!\w)r\s*=\s*' + quantity, text_val)
     if m_r:
-        radius = float(m_r.group(1))
+        radius = parse_length_mm(m_r.group(1), "bend radius")
         return angle, radius, span
 
-    m_s = re.search(r's\s*=\s*' + _BEND_ANNOTATION_NUMBER_RE, text_val)
+    m_s = re.search(r'(?<!\w)s\s*=\s*' + quantity, text_val)
     if not m_s:
         return angle, radius, span
 
-    span = float(m_s.group(1))
+    span = parse_length_mm(m_s.group(1), "bend spanning")
     angle_rad = math.radians(angle)
     if abs(angle_rad) <= 1e-9:
         FreeCAD.Console.PrintWarning(
@@ -746,6 +775,41 @@ def _single_planar_face(shape):
         return faces[0]
     raise ValueError(
         "planar boolean produced {} faces; expected one".format(len(faces)))
+
+
+def _linear_wire_distance_data(wire):
+    """Prepare exact straight-edge distances, including touching outlines."""
+    segments = []
+    for edge in wire.Edges:
+        if type(getattr(edge, 'Curve', None)).__name__ not in (
+                'Line', 'LineSegment'):
+            return None
+        vertices = edge.Vertexes
+        if len(vertices) != 2:
+            return None
+        a, b = (v.Point for v in vertices)
+        dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+        length_sq = dx * dx + dy * dy + dz * dz
+        segments.append((a.x, a.y, a.z, dx, dy, dz, length_sq))
+    return segments or None
+
+
+def _point_near_wire(point, wire, segments, tolerance):
+    """Use segment distance for linear wires; preserve OCC at the cutoff."""
+    if segments is not None:
+        best = float('inf')
+        for ax, ay, az, dx, dy, dz, length_sq in segments:
+            px, py, pz = point.x - ax, point.y - ay, point.z - az
+            t = (max(0.0, min(1.0, (px * dx + py * dy + pz * dz)
+                             / length_sq)) if length_sq else 0.0)
+            distance_sq = ((px - t * dx) ** 2 + (py - t * dy) ** 2
+                           + (pz - t * dz) ** 2)
+            best = min(best, distance_sq)
+            if best < (tolerance - 1e-7) ** 2:
+                return True
+        if best > (tolerance + 1e-7) ** 2:
+            return False
+    return Part.Vertex(point).distToShape(wire)[0] < tolerance
 
 
 def _linear_outline_data(face):
@@ -1062,7 +1126,8 @@ def _load_kicad_env_vars(kicad, board=None):
         kicad, board, source_path=__file__)
     visible = {
         key: value for key, value in env.items()
-        if key == 'KIPRJMOD' or key.startswith('KICAD')
+        if key == 'KIPRJMOD' or (key.startswith('KICAD')
+                                  and not key.startswith('KICAD_API_'))
     }
     FreeCAD.Console.PrintMessage(
         f"FreekiCAD: Loaded path variables: {visible}\n"
@@ -1115,12 +1180,12 @@ def _load_footprint_models(fp_info, thickness, doc, step_cache=None):
             mt = None
         mtimes[canonical] = mt
 
-        # Load STEP (check cache status before call)
+        # Load the external model (check cache status before call)
         was_cached = step_cache is not None and canonical in step_cache
-        parts = _load_step(model_path, doc, cache=step_cache)
+        parts = _load_model(model_path, doc, cache=step_cache)
         if not parts:
             FreeCAD.Console.PrintWarning(
-                f"FreekiCAD:   {ref}: STEP load returned "
+                f"FreekiCAD:   {ref}: model load returned "
                 f"no shapes: {model_path}\n"
             )
             continue
@@ -1477,7 +1542,7 @@ def load_board(filepath, socket_path, import_outer_copper=False,
 
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: Connecting to KiCad at {socket_path}\n")
-        kicad = KiCad(socket_path=f"ipc://{socket_path}")
+        kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
         board = _kipy_ready_board(kicad)
 
         # Load KiCad path variables
@@ -2093,7 +2158,9 @@ def load_board(filepath, socket_path, import_outer_copper=False,
                         stackup, BoardLayer,
                         total_thickness=thickness):
                     stiffener_surface_offsets[
-                        silk_info.name == "F.SilkS"] = silk_info.thickness
+                        silk_info.name == "F.SilkS"] = abs(
+                            silk_info.z - (thickness
+                                           if silk_info.name == "F.SilkS" else 0.0))
             stiffener_layers = build_stiffener_layers(
                 all_shapes, all_text, stiffener_layer_defs, thickness,
                 to_concrete=to_concrete_board_shape,
@@ -2726,6 +2793,9 @@ def _handle_bus_response(reply):
     Dispatches to the appropriate PcbObject method based on
     action/object/component."""
     action = reply.get("action")
+    if action == "open-file":
+        # Navigation has no model update; send_request already logs errors.
+        return
     obj_label = reply.get("object", "")
     socket_path = reply.get("socket")
     component = reply.get("component", "")
@@ -2744,7 +2814,7 @@ def _handle_bus_response(reply):
                 obj, reply.get("message", "unknown workspace error"))
         elif action == "monitor-couplers":
             proxy._handle_coupler_monitor_error(
-                reply.get("message", "unknown workspace error"))
+                obj, reply.get("message", "unknown workspace error"))
         elif action == "update-coupler":
             proxy._handle_update_coupler_error(
                 obj, component,
@@ -2757,7 +2827,7 @@ def _handle_bus_response(reply):
         return
 
     if action == "reload":
-        proxy._handle_reload_response(obj, socket_path)
+        proxy._handle_reload_response(obj, socket_path, cache_import=True)
     elif action == "open-sketch":
         proxy._handle_open_sketch_response(obj, socket_path)
     elif action == "move-component":
@@ -2865,7 +2935,7 @@ class PcbObject:
         obj.ImportSolderMask = False
         obj.addProperty(
             "App::PropertyBool", "ImportSilkscreen", "LinkedFile",
-            "Import outward physical F.SilkS and B.SilkS display shells"
+            "Import F.SilkS and B.SilkS planes 10 microns above the board"
         )
         obj.ImportSilkscreen = False
         obj.addProperty(
@@ -3039,6 +3109,10 @@ class PcbObject:
             self._coupler_socket_pending = False
         if not hasattr(self, '_coupler_poll_retry_after'):
             self._coupler_poll_retry_after = 0.0
+        if not hasattr(self, '_coupler_monitor_failure_count'):
+            self._coupler_monitor_failure_count = 0
+        if not hasattr(self, '_coupler_monitor_unavailable'):
+            self._coupler_monitor_unavailable = False
         if not hasattr(self, '_coupler_update_timers'):
             self._coupler_update_timers = {}
         if not hasattr(self, '_pending_coupler_updates'):
@@ -3392,7 +3466,7 @@ class PcbObject:
             silk_obj.setPropertyStatus("SilkscreenLayer", "ReadOnly")
             silk_obj.addProperty(
                 "App::PropertyLength", "SilkscreenThickness", "KiCad",
-                "Physical silkscreen thickness from the KiCad stackup")
+                "Silkscreen display thickness (zero for a planar surface)")
             silk_obj.SilkscreenThickness = layer_data['thickness']
             silk_obj.setPropertyStatus("SilkscreenThickness", "ReadOnly")
             silk_obj.Shape = layer_data['shape']
@@ -3402,7 +3476,7 @@ class PcbObject:
                 layer_data['profile_shape'].copy()
             self._layer_extrusion_directions[silk_obj.Name] = \
                 float(layer_data['direction'])
-            self._layer_cap_modes[silk_obj.Name] = "outer"
+            self._layer_cap_modes[silk_obj.Name] = "plane"
             try:
                 self._remember_export_colors(
                     silk_obj, layer_data['color'])
@@ -4083,7 +4157,7 @@ class PcbObject:
         from kipy.kicad import KiCad
         from kipy.geometry import Vector2
 
-        kicad = KiCad(socket_path=f"ipc://{socket_path}")
+        kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
         board = _kipy_ready_board(kicad)
         target_fp = None
         for footprint in _kipy_retry(board.get_footprints):
@@ -4181,7 +4255,7 @@ class PcbObject:
             from .im_client import send_request
             send_request(
                 "monitor-couplers", _resolved_linked_filename(obj),
-                object_label=obj.Label)
+                object_label=obj.Label, log_errors=False)
             return
 
         import threading
@@ -4198,7 +4272,7 @@ class PcbObject:
             try:
                 from kipy.kicad import KiCad
                 kicad = KiCad(
-                    socket_path=f"ipc://{socket_path}", timeout_ms=900)
+                    socket_path=f"ipc://{socket_path}", kicad_token="", timeout_ms=900)
                 board = kicad.get_board()
                 live_poses = []
                 for footprint in board.get_footprints():
@@ -4232,13 +4306,10 @@ class PcbObject:
             # ReferenceError, so silently discard the obsolete result.
             getattr(obj, 'Name', None)
             if error is not None:
-                self._coupler_poll_retry_after = time.monotonic() + 2.0
                 self._cached_socket_path = None
-                FreeCAD.Console.PrintWarning(
-                    f"FreekiCAD: Coupler monitor for '{obj.Label}' failed: "
-                    f"{error}; retrying later\n")
+                self._record_coupler_monitor_failure(obj, error)
                 return
-            self._coupler_poll_retry_after = 0.0
+            self._record_coupler_monitor_recovery(obj)
             if live_poses is None:
                 return
 
@@ -4311,13 +4382,39 @@ class PcbObject:
         self._coupler_poll_retry_after = 0.0
         self._cached_socket_path = socket_path
 
-    def _handle_coupler_monitor_error(self, message):
+    def _record_coupler_monitor_failure(self, obj, message):
+        """Back off repeated monitor failures and report a disconnect once."""
+        self._ensure_coupler_monitor_state()
+        self._coupler_monitor_failure_count += 1
+        exponent = min(self._coupler_monitor_failure_count - 1, 10)
+        delay = min(
+            COUPLER_MONITOR_RETRY_INITIAL_S * (2 ** exponent),
+            COUPLER_MONITOR_RETRY_MAX_S,
+        )
+        self._coupler_poll_retry_after = time.monotonic() + delay
+        if not self._coupler_monitor_unavailable:
+            self._coupler_monitor_unavailable = True
+            FreeCAD.Console.PrintMessage(
+                f"FreekiCAD: Coupler monitor unavailable for "
+                f"'{obj.Label}': {message}; retrying in background\n")
+
+    def _record_coupler_monitor_recovery(self, obj):
+        """Clear monitor backoff and report recovery after a disconnect."""
+        self._ensure_coupler_monitor_state()
+        was_unavailable = self._coupler_monitor_unavailable
+        self._coupler_monitor_failure_count = 0
+        self._coupler_monitor_unavailable = False
+        self._coupler_poll_retry_after = 0.0
+        if was_unavailable:
+            FreeCAD.Console.PrintMessage(
+                f"FreekiCAD: Coupler monitor reconnected for "
+                f"'{obj.Label}'\n")
+
+    def _handle_coupler_monitor_error(self, obj, message):
         """Back off after a workspace socket-resolution failure."""
         self._ensure_coupler_monitor_state()
         self._coupler_socket_pending = False
-        self._coupler_poll_retry_after = time.monotonic() + 5.0
-        FreeCAD.Console.PrintWarning(
-            f"FreekiCAD: Coupler monitor unavailable: {message}\n")
+        self._record_coupler_monitor_failure(obj, message)
 
     def _build_coupler_children(self, obj, couplers):
         """Create hidden child markers for the board's coupler planes."""
@@ -4675,6 +4772,9 @@ class PcbObject:
     def _schedule_rebend(self, obj):
         """Schedule a deferred rebend, coalescing changes from multiple
         bend lines and PcbObject properties into a single rebend call."""
+        # Import writes Angle/Radius itself and applies all bends at the end.
+        if getattr(self, '_in_execute', False):
+            return
         from PySide import QtCore, QtWidgets
 
         self._ensure_rebend_timer_state()
@@ -4788,6 +4888,10 @@ class PcbObject:
     def _rebend(self, obj):
         """Re-apply bending after Radius/Angle/Active or EnableBending
         changes on a bend line."""
+        # STEP loading processes Qt events, so an earlier timer can fire
+        # inside a reload. The reload already owns the final bending pass.
+        if getattr(self, '_in_execute', False):
+            return
         if not hasattr(self, '_unbent_board_shape'):
             self._resume_component_move_sync(delay_ms=0)
             return
@@ -11654,12 +11758,11 @@ class PcbObject:
         # Keep only segments that cross the board: both endpoints
         # must lie on (or very near) the outline wire.
         wire = board_face.OuterWire
+        distance_segments = _linear_wire_distance_data(wire)
         crossing = []
         for sp, ep in segments:
-            sv = Part.Vertex(FreeCAD.Vector(sp.x, sp.y, 0))
-            ev = Part.Vertex(FreeCAD.Vector(ep.x, ep.y, 0))
-            if sv.distToShape(wire)[0] < 0.1 \
-                    and ev.distToShape(wire)[0] < 0.1:
+            if _point_near_wire(sp, wire, distance_segments, 0.1) \
+                    and _point_near_wire(ep, wire, distance_segments, 0.1):
                 crossing.append((sp, ep))
         return crossing
 
@@ -12430,7 +12533,7 @@ class PcbObject:
         if socket_path is None:
             return
         try:
-            kicad = KiCad(socket_path=f"ipc://{socket_path}")
+            kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
             _kipy_ready_board(kicad)
             self._kicad = kicad
             FreeCAD.Console.PrintMessage(
@@ -12454,7 +12557,7 @@ class PcbObject:
         try:
             kicad = getattr(self, '_kicad', None)
             if kicad is None:
-                kicad = KiCad(socket_path=f"ipc://{socket_path}")
+                kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
                 self._kicad = kicad
             return _kipy_ready_board(kicad)
         except Exception as e:
@@ -12523,16 +12626,12 @@ class PcbObject:
                         seg.layer = BoardLayer.BL_Edge_Cuts
                         new_items.append(seg)
                     elif isinstance(geo, Part.ArcOfCircle):
-                        mid_angle = (geo.FirstParameter
-                                     + geo.LastParameter) / 2
-                        mid_x = (geo.Center.x
-                                 + geo.Radius * math.cos(mid_angle))
-                        mid_y = (geo.Center.y
-                                 + geo.Radius * math.sin(mid_angle))
+                        mid = geo.value((geo.FirstParameter
+                                         + geo.LastParameter) / 2)
                         arc = BoardArc()
                         arc.start = Vector2.from_xy_mm(
                             geo.StartPoint.x, -geo.StartPoint.y)
-                        arc.mid = Vector2.from_xy_mm(mid_x, -mid_y)
+                        arc.mid = Vector2.from_xy_mm(mid.x, -mid.y)
                         arc.end = Vector2.from_xy_mm(
                             geo.EndPoint.x, -geo.EndPoint.y)
                         arc.layer = BoardLayer.BL_Edge_Cuts
@@ -12576,72 +12675,80 @@ class PcbObject:
 
         obs = _ensure_sketch_observer()
         obs.suppress(sketch.Name)
-        geo_indices = []
-        for edge in edges:
-            curve = edge.Curve
-            try:
-                if isinstance(curve, Part.Line) or isinstance(curve, Part.LineSegment):
-                    p1 = edge.Vertexes[0].Point
-                    p2 = edge.Vertexes[1].Point
-                    seg = Part.LineSegment(
-                        FreeCAD.Vector(p1.x, p1.y, 0),
-                        FreeCAD.Vector(p2.x, p2.y, 0),
-                    )
-                    idx = sketch.addGeometry(seg, False)
-                    geo_indices.append(idx)
-                elif isinstance(curve, Part.Circle):
-                    if edge.isClosed():
-                        # Full circle
-                        circle = Part.Circle(
-                            FreeCAD.Vector(curve.Center.x, curve.Center.y, 0),
-                            FreeCAD.Vector(0, 0, 1),
-                            curve.Radius,
+        try:
+            geo_indices = []
+            for edge in edges:
+                curve = edge.Curve
+                try:
+                    if isinstance(curve, Part.Line) or isinstance(curve, Part.LineSegment):
+                        p1 = edge.Vertexes[0].Point
+                        p2 = edge.Vertexes[1].Point
+                        seg = Part.LineSegment(
+                            FreeCAD.Vector(p1.x, p1.y, 0),
+                            FreeCAD.Vector(p2.x, p2.y, 0),
                         )
-                        idx = sketch.addGeometry(circle, False)
+                        idx = sketch.addGeometry(seg, False)
                         geo_indices.append(idx)
-                    else:
-                        # Arc
-                        arc = Part.ArcOfCircle(
-                            Part.Circle(
+                    elif isinstance(curve, Part.Circle):
+                        if edge.isClosed():
+                            # Full circle
+                            circle = Part.Circle(
                                 FreeCAD.Vector(curve.Center.x, curve.Center.y, 0),
                                 FreeCAD.Vector(0, 0, 1),
                                 curve.Radius,
-                            ),
-                            edge.FirstParameter,
-                            edge.LastParameter,
+                            )
+                            idx = sketch.addGeometry(circle, False)
+                            geo_indices.append(idx)
+                        else:
+                            # Sample the original curve: its axis and local X
+                            # direction need not match a new XY circle.
+                            arc = Part.Arc(
+                                edge.valueAt(edge.FirstParameter),
+                                edge.valueAt((edge.FirstParameter
+                                              + edge.LastParameter) / 2),
+                                edge.valueAt(edge.LastParameter))
+                            idx = sketch.addGeometry(arc, False)
+                            geo_indices.append(idx)
+                    else:
+                        FreeCAD.Console.PrintWarning(
+                            f"FreekiCAD: Unsupported outline curve type: "
+                            f"{type(curve).__name__}\n"
                         )
-                        idx = sketch.addGeometry(arc, False)
-                        geo_indices.append(idx)
-                else:
-                    FreeCAD.Console.PrintWarning(
-                        f"FreekiCAD: Unsupported outline curve type: "
-                        f"{type(curve).__name__}\n"
-                    )
-            except Exception as ex:
-                FreeCAD.Console.PrintWarning(
-                    f"FreekiCAD: Failed to add outline geometry: {ex}\n"
-                )
-
-        # Add coincident constraints between consecutive edges
-        if len(geo_indices) >= 2:
-            for i in range(len(geo_indices)):
-                curr = geo_indices[i]
-                nxt = geo_indices[(i + 1) % len(geo_indices)]
-                try:
-                    sketch.addConstraint(
-                        Sketcher.Constraint("Coincident",
-                                            curr, 2, nxt, 1))
                 except Exception as ex:
                     FreeCAD.Console.PrintWarning(
-                        f"FreekiCAD: Failed to add coincident constraint "
-                        f"between geo {curr} and {nxt}: {ex}\n"
+                        f"FreekiCAD: Failed to add outline geometry: {ex}\n"
                     )
 
-        obs.unsuppress(sketch.Name)
+            # Sketcher can reverse arc endpoint numbering when normalizing its
+            # plane. Match actual sketch endpoints, not the wire traversal order.
+            endpoints = []
+            for idx in geo_indices:
+                if isinstance(sketch.Geometry[idx], Part.Circle):
+                    continue
+                for pos in (1, 2):
+                    endpoints.append((idx, pos, sketch.getPoint(idx, pos)))
+            constraints = []
+            for i, (idx, pos, point) in enumerate(endpoints):
+                matches = [(other, other_pos) for j, (other, other_pos, p)
+                           in enumerate(endpoints)
+                           if j != i and (point - p).Length < 1e-6]
+                # Ambiguous junctions and open ends must not pull geometry into
+                # a different shape. Ordinary closed outlines have one partner.
+                if len(matches) == 1:
+                    other, other_pos = matches[0]
+                    if idx < other:
+                        constraints.append(Sketcher.Constraint(
+                            "Coincident", idx, pos, other, other_pos))
+            if constraints:
+                sketch.addConstraint(constraints)
+            sketch.solve()
+
+        finally:
+            obs.unsuppress(sketch.Name)
 
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: Built outline sketch with {len(geo_indices)} "
-            f"elements and {len(geo_indices)} constraints\n"
+            f"elements and {len(constraints)} constraints\n"
         )
 
     def _check_file_changed(self, obj):
@@ -12705,12 +12812,42 @@ class PcbObject:
         _log_surface_reload(
             f"reload request sent; force={'yes' if force else 'no'}")
 
-    def reload_sync(self, obj, reposition=True):
+    def _read_import_fingerprint(self, obj, socket_path):
+        from .ImportFingerprint import read_fingerprint
+        from kipy.kicad import KiCad
+        started = time.perf_counter()
+        try:
+            kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
+            board = _kipy_ready_board(kicad)
+            filename = _resolved_linked_filename(obj)
+            settings = {name: getattr(obj, name, None) for name in
+                        self._REBEND_PROPERTIES + self._SURFACE_PROPERTIES}
+            return read_fingerprint(
+                kicad, board, filename, settings,
+                _get_board_color_from_file(filename))
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"FreekiCAD: Cannot compare import inputs; reloading: {exc}\n")
+            return None
+        finally:
+            FreeCAD.Console.PrintMessage(
+                f"FreekiCAD: [profile] import fingerprint: "
+                f"{time.perf_counter() - started:.3f}s\n")
+
+    def _import_child_state(self, obj):
+        # Detect deleted children and locally edited bends without hashing BReps.
+        return tuple((child.Name, getattr(child, 'Angle', None),
+                      getattr(child, 'Radius', None),
+                      getattr(child, 'Active', None))
+                     for child in getattr(obj, 'Group', []))
+
+    def reload_sync(self, obj, reposition=True, socket_path=None,
+                    only_if_changed=False):
         """Synchronously reload a PCB for headless export.
 
-        The workspace manager still owns KiCad launch and socket-readiness
-        retries.  This method returns only after the board and all component
-        models have been rebuilt from their source files.
+        An explicit socket reads the invoking KiCad editor directly. Otherwise
+        the instance mesh resolves the editor. Open in FreeCAD can opt into a
+        session-local content comparison; explicit reloads remain unconditional.
         """
         if getattr(self, '_reloading', False):
             raise RuntimeError(f"'{obj.Label}' is already reloading")
@@ -12727,11 +12864,32 @@ class PcbObject:
         self._coupler_monitor_generation += 1
         self._ensure_properties(obj)
         try:
-            from .im_client import request_sync
-            reply = request_sync(
-                "reload", filename, object_label=obj.Label)
+            if socket_path is None:
+                from .im_client import request_sync
+                reply = request_sync(
+                    "reload", filename, object_label=obj.Label)
+                socket_path = reply["socket"]
+            fingerprint = (self._read_import_fingerprint(obj, socket_path)
+                           if only_if_changed else None)
+            cached = getattr(self, '_last_import_fingerprint', None)
+            if (fingerprint is not None and cached is not None
+                    and cached == (fingerprint, self._import_child_state(obj))
+                    and not self._surface_reload_is_pending()
+                    and any(child.Name.endswith('_Board')
+                            and hasattr(child, 'Shape')
+                            and not child.Shape.isNull()
+                            for child in getattr(obj, 'Group', []))):
+                self._cached_socket_path = socket_path
+                self._reloading = False
+                if reposition:
+                    self._reposition_all_coupled_objects(obj.Document)
+                FreeCAD.Console.PrintMessage(
+                    f"FreekiCAD: Skipping reload of '{obj.Name}' "
+                    "(import inputs unchanged)\n")
+                return True
+            self._last_import_fingerprint = None
             self._handle_reload_response(
-                obj, reply["socket"], reposition=reposition)
+                obj, socket_path, reposition=reposition)
         except Exception:
             self._reloading = False
             self._reload_failed = True
@@ -12747,10 +12905,29 @@ class PcbObject:
             self._reload_failed = True
             raise RuntimeError(
                 f"Fresh load of '{obj.Label}' produced no board geometry")
+        if fingerprint is not None:
+            # A user can keep editing KiCad while FreeCAD builds geometry.
+            # Only cache a load whose inputs stayed stable across the import.
+            after = self._read_import_fingerprint(obj, socket_path)
+            if after == fingerprint:
+                self._last_import_fingerprint = (
+                    fingerprint, self._import_child_state(obj))
         return True
 
-    def _handle_reload_response(self, obj, socket_path, reposition=True):
+    def _handle_reload_response(self, obj, socket_path, reposition=True,
+                                cache_import=False):
         """Called when the workspace bus responds to a reload request."""
+        self._last_import_fingerprint = None
+        fingerprint = (self._read_import_fingerprint(obj, socket_path)
+                       if cache_import else None)
+        # This load consumes the current layer settings. A previously queued
+        # debounce must not force another load after this one completes.
+        self._ensure_surface_reload_timer_state()
+        if self._surface_reload_timer is not None:
+            self._surface_reload_timer.stop()
+        self._surface_reload_target = None
+        self._surface_reload_property = None
+        self._surface_reload_deadline = 0.0
         import time as _time
         _t0_reload = _time.time()
         self._ensure_coupler_monitor_state()
@@ -12763,28 +12940,29 @@ class PcbObject:
         if _sketch_observer is not None:
             _sketch_observer.suppress(outline_name)
         try:
-            FreeCAD.Console.PrintMessage(
-                f"FreekiCAD: Reloading '{obj.Name}'...\n")
-            self._suppress_execute = True
-            if hasattr(obj, 'FileMtime'):
-                obj.FileMtime = ""
-            _t_remove = _time.time()
-            existing_comps, existing_bends = self._remove_board_children(obj)
-            FreeCAD.Console.PrintMessage(
-                f"FreekiCAD: [profile] _remove_board_children: "
-                f"{_time.time() - _t_remove:.3f}s\n")
-            self._in_execute = True
-            self._do_execute(obj, socket_path,
-                             existing_components=existing_comps,
-                             existing_bends=existing_bends)
-            portable_filename = _portable_linked_filename(
-                obj, resolved_filename)
-            if portable_filename != obj.FileName:
-                self._updating_filename = True
-                try:
-                    obj.FileName = portable_filename
-                finally:
-                    self._updating_filename = False
+            with _pcb_import_status(obj):
+                FreeCAD.Console.PrintMessage(
+                    f"FreekiCAD: Reloading '{obj.Name}'...\n")
+                self._suppress_execute = True
+                if hasattr(obj, 'FileMtime'):
+                    obj.FileMtime = ""
+                _t_remove = _time.time()
+                existing_comps, existing_bends = self._remove_board_children(obj)
+                FreeCAD.Console.PrintMessage(
+                    f"FreekiCAD: [profile] _remove_board_children: "
+                    f"{_time.time() - _t_remove:.3f}s\n")
+                self._in_execute = True
+                self._do_execute(obj, socket_path,
+                                 existing_components=existing_comps,
+                                 existing_bends=existing_bends)
+                portable_filename = _portable_linked_filename(
+                    obj, resolved_filename)
+                if portable_filename != obj.FileName:
+                    self._updating_filename = True
+                    try:
+                        obj.FileName = portable_filename
+                    finally:
+                        self._updating_filename = False
         finally:
             self._in_execute = False
             self._suppress_execute = False
@@ -12800,6 +12978,16 @@ class PcbObject:
                 f"{_time.time() - _t0_reload:.3f}s\n")
         if reposition:
             self._reposition_all_coupled_objects(obj.Document)
+        if (fingerprint is not None
+                and any(child.Name.endswith('_Board')
+                        and hasattr(child, 'Shape')
+                        and not child.Shape.isNull()
+                        for child in getattr(obj, 'Group', []))
+                and self._read_import_fingerprint(obj, socket_path) == fingerprint):
+            # The async/manual path must obey the same before/after check as
+            # reload_sync: KiCad can change while geometry is being built.
+            self._last_import_fingerprint = (
+                fingerprint, self._import_child_state(obj))
 
     def _handle_reload_error(self, obj, message):
         """Release a failed asynchronous reload so AutoReload can retry."""
@@ -12834,7 +13022,7 @@ class PcbObject:
             from kipy.kicad import KiCad
             from kipy.geometry import Vector2, Angle
 
-            kicad = KiCad(socket_path=f"ipc://{socket_path}")
+            kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="")
             compatibility = get_kicad_compat(kicad.get_version())
             board = _kipy_ready_board(kicad)
 
@@ -12897,6 +13085,7 @@ class PcbObject:
     def loads(self, state):
         if state:
             self.Type = "PcbObject"
+        self._last_import_fingerprint = None
         self._board_color = None
         self._ensure_rebend_timer_state()
         self._ensure_surface_reload_timer_state()
@@ -12969,7 +13158,7 @@ class PcbObject:
         if not hasattr(obj, 'ImportSilkscreen'):
             obj.addProperty(
                 "App::PropertyBool", "ImportSilkscreen", "LinkedFile",
-                "Import outward physical F.SilkS and B.SilkS display shells")
+                "Import F.SilkS and B.SilkS planes 10 microns above the board")
             obj.ImportSilkscreen = False
         if not hasattr(obj, 'SnapToCoupler'):
             obj.addProperty(
@@ -13102,6 +13291,16 @@ class PcbObjectViewProvider:
     def setupContextMenu(self, vobj, menu):
         action = menu.addAction("Reload KiCad PCB")
         action.triggered.connect(lambda: self._reload(vobj))
+        action = menu.addAction("Goto KiCad")
+        action.setEnabled(bool(getattr(vobj.Object, "FileName", "")))
+        action.triggered.connect(lambda: self._goto_kicad(vobj))
+
+    def _goto_kicad(self, vobj):
+        from .im_client import send_request
+        obj = vobj.Object
+        filename = _resolved_linked_filename(obj)
+        if filename:
+            send_request("open-file", filename, object_label=obj.Label)
 
     def _reload(self, vobj):
         obj = vobj.Object

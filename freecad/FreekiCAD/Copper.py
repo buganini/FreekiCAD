@@ -10,15 +10,16 @@ import Part
 try:
     import shapely
     from shapely.geometry import Polygon
+    from shapely.geometry.polygon import orient
 except Exception:
     shapely = None
     Polygon = None
-
 
 NM_PER_MM = 1_000_000.0
 DEFAULT_COPPER_THICKNESS_MM = 0.035
 COPPER_2D_DEFLECTION_MM = 0.002
 COPPER_2D_GRID_MM = 0.001
+COPPER_FACE_PARTITION_MM = 5.0
 COPPER_COLOR = (0.72, 0.45, 0.12)
 
 
@@ -178,7 +179,7 @@ def _polygon_face(points):
     return Part.Face(Part.makePolygon(pts))
 
 
-def _capsule(p0, p1, width):
+def _capsule_edges(p0, p1, width):
     radius = width / 2.0
     dx = p1.x - p0.x
     dy = p1.y - p0.y
@@ -186,7 +187,7 @@ def _capsule(p0, p1, width):
     if radius <= 0:
         return None
     if length <= 1e-12:
-        return _circle_face(radius, p0)
+        return [Part.makeCircle(radius, p0)]
     ux, uy = dx / length, dy / length
     nx, ny = -uy * radius, ux * radius
     a_top = FreeCAD.Vector(p0.x + nx, p0.y + ny, 0)
@@ -209,7 +210,12 @@ def _capsule(p0, p1, width):
             a_top,
         ).toShape(),
     ]
-    return Part.Face(Part.Wire(edges))
+    return edges
+
+
+def _capsule(p0, p1, width):
+    edges = _capsule_edges(p0, p1, width)
+    return Part.Face(Part.Wire(edges)) if edges else None
 
 
 def _arc_stroke(start, mid, end, width):
@@ -273,15 +279,39 @@ def _polyline_edges(polyline):
     return result
 
 
-def polygon_with_holes_face(polygon):
-    outline = _polyline_edges(polygon.outline)
-    if not outline:
+def _polyline_wire(polyline):
+    nodes = list(polyline.nodes)
+    if len(nodes) < 2:
         return None
-    wires = [Part.Wire(outline)]
+    if any(getattr(node, "has_arc", False) for node in nodes):
+        edges = _polyline_edges(polyline)
+        return Part.Wire(edges) if edges else None
+
+    # These points are already ordered. Making independent edges and passing
+    # them to Part.Wire repeats vertex matching, which is costly for large
+    # filled zones. makePolygon connects successive points directly.
+    points = [_v(nodes[0].point)]
+    for node in nodes[1:]:
+        point = _v(node.point)
+        if points[-1].distanceToPoint(point) > 1e-9:
+            points.append(point)
+    if len(points) < 2:
+        return None
+    if (getattr(polyline, "closed", True)
+            and points[-1].distanceToPoint(points[0]) > 1e-9):
+        points.append(points[0])
+    return Part.makePolygon(points)
+
+
+def polygon_with_holes_face(polygon):
+    outline = _polyline_wire(polygon.outline)
+    if outline is None:
+        return None
+    wires = [outline]
     for hole in polygon.holes:
-        edges = _polyline_edges(hole)
-        if edges:
-            wires.append(Part.Wire(edges))
+        wire = _polyline_wire(hole)
+        if wire is not None:
+            wires.append(wire)
     if len(wires) == 1:
         return Part.Face(wires[0])
     return Part.Face(wires, "Part::FaceMakerBullseye")
@@ -610,6 +640,83 @@ def read_copper_items(board, target_layers, board_shapes=None, warn=None):
     return by_layer
 
 
+def _track_polygons(track):
+    """Keep OCC curve sampling, but skip intermediate capsule wires/faces."""
+    if shapely is None:
+        return None
+    width = track.width / NM_PER_MM
+    start, end = _v(track.start), _v(track.end)
+    mid = _v(track.mid) if type(track).__name__ == "ArcTrack" else None
+    return _stroke_polygons(start, end, width, mid)
+
+
+def board_graphic_polygons(graphic):
+    """Direct polygons for line/arc graphics, including rendered text strokes."""
+    if shapely is None:
+        return None
+    kind = type(graphic).__name__
+    if kind not in ("BoardSegment", "Segment", "BoardArc", "Arc"):
+        return None
+    width = max(float(getattr(getattr(graphic.attributes, "stroke", None),
+                              "width", 0)) / NM_PER_MM, 0.001)
+    mid = _v(graphic.mid) if kind in ("BoardArc", "Arc") else None
+    return _stroke_polygons(_v(graphic.start), _v(graphic.end), width, mid)
+
+
+def _stroke_polygons(start, end, width, mid=None):
+    points = [start, end]
+    if mid is not None:
+        try:
+            edge = Part.Arc(start, mid, end).toShape()
+            points = edge.discretize(Deflection=max(width / 8.0, 0.01))
+        except Exception:
+            pass
+    polygons = []
+    for a, b in zip(points, points[1:]):
+        edges = _capsule_edges(a, b, width)
+        if not edges:
+            return None
+        ring = _edges_coordinates(edges)
+        if ring is None:
+            return None
+        polygon = Polygon(ring)
+        if not polygon.is_valid:
+            return None
+        polygons.append(polygon)
+    return polygons or None
+
+
+def _straight_pad_polygon(pad, layer, pad_shape_enum):
+    """Bypass BRep construction for undrilled straight-sided pads."""
+    if shapely is None or pad_shape_enum is None:
+        return None
+    if layer.shape not in (pad_shape_enum.PSS_RECTANGLE,
+                           pad_shape_enum.PSS_TRAPEZOID):
+        return None
+    drill = pad.padstack.drill.diameter
+    if drill.x > 0 and drill.y > 0:
+        return None
+    width, height = layer.size.x / NM_PER_MM, layer.size.y / NM_PER_MM
+    if width <= 0 or height <= 0:
+        return None
+    dx = dy = 0.0
+    if layer.shape == pad_shape_enum.PSS_TRAPEZOID:
+        dx = layer.trapezoid_delta.x / NM_PER_MM / 2.0
+        dy = layer.trapezoid_delta.y / NM_PER_MM / 2.0
+    points = [(-width / 2 - dy, -height / 2 - dx),
+              (width / 2 + dy, -height / 2 + dx),
+              (width / 2 - dy, height / 2 + dx),
+              (-width / 2 + dy, height / 2 - dx)]
+    degrees = -float(getattr(pad.padstack.angle, "degrees", 0.0))
+    angle = math.radians(degrees) if abs(degrees) > 1e-12 else 0.0
+    cosine, sine = math.cos(angle), math.sin(angle)
+    ox, oy = layer.offset.x / NM_PER_MM, -layer.offset.y / NM_PER_MM
+    px, py = pad.position.x / NM_PER_MM, -pad.position.y / NM_PER_MM
+    result = Polygon([((x * cosine - y * sine + ox) + px,
+                       (x * sine + y * cosine + oy) + py) for x, y in points])
+    return result if result.is_valid else None
+
+
 def _copper_item_shape(item, pad_shape_enum):
     if item.kind == "track":
         track = item.source
@@ -643,8 +750,12 @@ def _copper_item_shape(item, pad_shape_enum):
 
 def _wire_coordinates(wire, deflection=COPPER_2D_DEFLECTION_MM):
     """Return one closed XY coordinate ring from an ordered FreeCAD wire."""
+    return _edges_coordinates(wire.Edges, deflection)
+
+
+def _edges_coordinates(edges, deflection=COPPER_2D_DEFLECTION_MM):
     segments = []
-    for edge in wire.Edges:
+    for edge in edges:
         points = edge.discretize(Deflection=deflection)
         coordinates = [(float(point.x), float(point.y)) for point in points]
         if len(coordinates) >= 2:
@@ -719,9 +830,38 @@ def _ring_wire(coordinates):
     return Part.makePolygon(points)
 
 
-def _polygons_to_part_shape(geometry):
-    faces = []
+def _partition_planar_polygons(geometry, size):
+    """Split existing planar polygons without approximating their boundaries."""
     for polygon in _polygon_geometries(geometry):
+        if polygon.is_empty:
+            continue
+        x0, y0, x1, y1 = polygon.bounds
+        ix0, iy0 = math.floor(x0 / size), math.floor(y0 / size)
+        ix1, iy1 = math.ceil(x1 / size), math.ceil(y1 / size)
+        cells = (ix1 - ix0) * (iy1 - iy0)
+        # Bound grid growth for unusually large geometry; retain the original
+        # face rather than allocating an unbounded array of clipping boxes.
+        if cells <= 1 or cells > 4096:
+            yield polygon
+            continue
+        boxes = [shapely.box(ix * size, iy * size,
+                             (ix + 1) * size, (iy + 1) * size)
+                 for ix in range(ix0, ix1) for iy in range(iy0, iy1)]
+        for clipped in shapely.intersection(polygon, boxes):
+            for region in _polygon_geometries(clipped):
+                if not region.is_empty and region.area > 0:
+                    yield region
+
+
+def _polygons_to_part_shape(geometry, partition_size=None):
+    faces = []
+    polygons = (_partition_planar_polygons(geometry, partition_size)
+                if partition_size is not None else _polygon_geometries(geometry))
+    for polygon in polygons:
+        # GEOS already classified the exterior and holes. Bullseye repeats
+        # wire containment analysis, which is very costly for dense pours.
+        # Build on the known XY plane with a CCW exterior and CW holes.
+        polygon = orient(polygon, sign=1.0)
         exterior = _ring_wire(polygon.exterior.coords)
         if exterior is None:
             continue
@@ -729,33 +869,117 @@ def _polygons_to_part_shape(geometry):
         wires.extend(wire for wire in (
             _ring_wire(interior.coords) for interior in polygon.interiors)
                      if wire is not None)
-        face = (Part.Face(wires[0]) if len(wires) == 1
-                else Part.Face(wires, "Part::FaceMakerBullseye"))
+        face = Part.Face(Part.Plane(), wires)
         faces.append(face)
     if not faces:
         raise RuntimeError("2D union returned no polygon faces")
     return faces[0] if len(faces) == 1 else Part.makeCompound(faces)
 
 
-def union_planar_profiles(shapes, warn=None, layer_name=""):
-    """Union overlapping coplanar profiles before physical extrusion."""
-    shapes = [shape for shape in shapes if shape is not None]
-    if not shapes:
+def _repair_zone_polygon(polygon):
+    """Rebuild simple stitched shell/hole rings without a linework overlay.
+
+    Only one shell with disjoint holes is accepted. Polygon validity and
+    bridge coverage establish equivalence to the old even/odd linework
+    repair; nested islands, crossings and ambiguous rings use that repair.
+    """
+    if not polygon.interiors:
+        try:
+            path, positions, loops, bridges = [], {}, [], []
+            for point in polygon.exterior.coords:
+                if point not in positions:
+                    positions[point] = len(path)
+                    path.append(point)
+                    continue
+                index = positions[point]
+                loop = path[index:] + [point]
+                if len(loop) > 3:
+                    loops.append(loop)
+                elif len(loop) == 3 and loop[0] != loop[1]:
+                    bridges.append(loop[:2])
+                for removed in path[index + 1:]:
+                    del positions[removed]
+                path = path[:index + 1]
+            if len(path) == 1 and loops:
+                def area(ring):
+                    return abs(sum(a[0] * b[1] - b[0] * a[1]
+                                   for a, b in zip(ring, ring[1:])))
+                outer = max(range(len(loops)), key=lambda i: area(loops[i]))
+                repaired = Polygon(loops[outer],
+                                   [ring for i, ring in enumerate(loops)
+                                    if i != outer])
+                # Validity rejects crossing/overlapping rings and nested holes.
+                if repaired.is_valid:
+                    # Retain linework fallback if a bridge leaves the fill.
+                    if not bridges or shapely.difference(
+                            shapely.MultiLineString(bridges), repaired).is_empty:
+                        return repaired
+        except Exception:
+            pass
+    return shapely.make_valid(polygon)
+
+
+def _straight_zone_polygon(polygon):
+    """Read ordered zone coordinates without an intermediate BRep round trip."""
+    if shapely is None:
         return None
-    if len(shapes) == 1:
+    rings = []
+    for polyline in [polygon.outline, *polygon.holes]:
+        coordinates = []
+        for node in polyline.nodes:
+            if getattr(node, "has_arc", False):
+                return None
+            point = node.point
+            coordinates.append((point.x / NM_PER_MM,
+                                -point.y / NM_PER_MM))
+        if len(coordinates) < 3:
+            return None
+        rings.append(coordinates)
+    try:
+        result = Polygon(rings[0], rings[1:])
+        # KiCad can encode holes as a stitched, self-touching outline.
+        if not result.is_valid:
+            result = _repair_zone_polygon(result)
+        return result if not result.is_empty and result.area > 0 else None
+    except Exception:
+        return None
+
+
+def union_planar_profiles(shapes, warn=None, layer_name="", seed_polygons=(),
+                          partition_size=None):
+    """Union BReps plus (BRep index, polygon) insertions in source order."""
+    shapes = [shape for shape in shapes if shape is not None]
+    seed_polygons = list(seed_polygons)
+    if not shapes and not seed_polygons:
+        return None
+    if len(shapes) == 1 and not seed_polygons:
         return shapes[0]
+    if not shapes and len(seed_polygons) == 1:
+        # A single original profile bypasses union and grid snapping too.
+        if partition_size is not None:
+            return _polygons_to_part_shape(seed_polygons[0][1], partition_size)
+        return _polygons_to_part_shape(seed_polygons[0][1])
     prefix = f" {layer_name}" if layer_name else ""
     if shapely is not None:
         try:
             polygons = []
-            for shape in shapes:
-                polygons.extend(_shape_to_polygons(shape))
+            insertions = {}
+            for index, polygon in seed_polygons:
+                insertions.setdefault(index, []).append(polygon)
+            # Preserve source order: GEOS precision-grid snapping can differ
+            # if identical inputs are regrouped by their representation.
+            for index in range(len(shapes) + 1):
+                polygons.extend(insertions.get(index, ()))
+                if index < len(shapes):
+                    polygons.extend(_shape_to_polygons(shapes[index]))
             if not polygons:
                 raise RuntimeError("no polygon faces were produced")
             merged = shapely.union_all(
                 polygons, grid_size=COPPER_2D_GRID_MM)
             if merged.is_empty:
                 raise RuntimeError("union returned an empty geometry")
+            if partition_size is not None:
+                return _polygons_to_part_shape(merged, partition_size)
             return _polygons_to_part_shape(merged)
         except Exception as ex:
             if warn:
@@ -764,6 +988,8 @@ def union_planar_profiles(shapes, warn=None, layer_name=""):
     elif warn:
         warn(f"Shapely is unavailable for{prefix}; trying BRep fallback")
 
+    # Construct BReps for direct zones only if the planar union failed.
+    shapes.extend(_polygons_to_part_shape(polygon) for _index, polygon in seed_polygons)
     try:
         profile = shapes[0].multiFuse(shapes[1:])
         if profile is None or profile.isNull():
@@ -891,7 +1117,9 @@ def build_copper_layers(board, stackup, board_layer, board_shapes=None,
     items_by_layer = read_copper_items(
         board, [info.layer for info in infos], board_shapes, warn)
     by_layer = {info.layer: [] for info in infos}
+    polygons_by_layer = {info.layer: [] for info in infos}
     counts = {info.layer: 0 for info in infos}
+    first_items = {}
     kind_counts = {info.layer: {} for info in infos}
     try:
         from kipy.proto.board.board_types_pb2 import PadStackShape
@@ -900,14 +1128,33 @@ def build_copper_layers(board, stackup, board_layer, board_shapes=None,
     for layer, items in items_by_layer.items():
         for item in items:
             try:
-                shape = _copper_item_shape(item, PadStackShape)
-                if shape is None:
-                    if warn:
-                        warn(f"Unsupported copper {item.kind}: "
-                             f"{type(item.source).__name__}")
-                    continue
-                by_layer[layer].append(shape)
+                polygon = (_straight_zone_polygon(item.source)
+                           if item.kind == "zone_polygon" else None)
+                if polygon is None and item.kind == "pad" and len(items) > 1:
+                    try:
+                        polygon = _straight_pad_polygon(
+                            item.source, item.geometry, PadStackShape)
+                    except Exception:
+                        pass  # Unsupported pad metadata keeps the BRep path.
+                polygons = [polygon] if polygon is not None else None
+                if polygons is None and item.kind == "track" and len(items) > 1:
+                    try:
+                        polygons = _track_polygons(item.source)
+                    except Exception:
+                        pass
+                if polygons is not None:
+                    polygons_by_layer[layer].extend(
+                        (len(by_layer[layer]), p) for p in polygons)
+                else:
+                    shape = _copper_item_shape(item, PadStackShape)
+                    if shape is None:
+                        if warn:
+                            warn(f"Unsupported copper {item.kind}: "
+                                 f"{type(item.source).__name__}")
+                        continue
+                    by_layer[layer].append(shape)
                 counts[layer] += 1
+                first_items.setdefault(layer, item)
                 kind_counts[layer][item.kind] = (
                     kind_counts[layer].get(item.kind, 0) + 1)
             except Exception as ex:
@@ -933,14 +1180,24 @@ def build_copper_layers(board, stackup, board_layer, board_shapes=None,
     result = []
     for info in infos:
         item_shapes = by_layer[info.layer]
-        if not item_shapes:
+        item_polygons = polygons_by_layer[info.layer]
+        if (counts[info.layer] == 1 and item_polygons
+                and first_items[info.layer].kind != "zone_polygon"):
+            # A lone original BRep bypasses polygonization/union entirely.
+            # Preserve its exact curves even when other items were skipped.
+            shape = _copper_item_shape(first_items[info.layer], PadStackShape)
+            item_shapes = [shape] if shape is not None else []
+            item_polygons = []
+        if not item_shapes and not item_polygons:
             continue
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] 2D union {info.name} start: "
-            f"items={len(item_shapes)}\n")
+            f"items={counts[info.layer]}\n")
         profile_started = time.perf_counter()
         profile = union_planar_profiles(
-            item_shapes, warn=warn, layer_name=info.name)
+            item_shapes, warn=warn, layer_name=info.name,
+            seed_polygons=item_polygons,
+            partition_size=COPPER_FACE_PARTITION_MM)
         profile_seconds = time.perf_counter() - profile_started
         FreeCAD.Console.PrintMessage(
             f"FreekiCAD: [profile] 2D union {info.name}: "

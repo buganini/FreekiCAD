@@ -34,6 +34,30 @@ if QtCore is not None:
             callback()
 
 
+def activate_gui_document(document):
+    """Activate a document and its MDI tab; call only on the GUI thread."""
+    import FreeCADGui
+    from PySide import QtWidgets
+    mdi = FreeCADGui.getMainWindow().findChild(QtWidgets.QMdiArea)
+    if mdi is not None:
+        view = FreeCADGui.getDocument(document.Name).activeView()
+        graphics = view.graphicsView() if view is not None and hasattr(
+            view, "graphicsView") else None
+        window = graphics
+        while window is not None and not isinstance(window, QtWidgets.QMdiSubWindow):
+            window = window.parentWidget()
+        if window is None:
+            # Some document types have no graphicsView; their tab
+            # title is usable only when its label is unambiguous.
+            label = str(getattr(document, "Label", ""))
+            matching = [candidate for candidate in mdi.subWindowList()
+                        if candidate.windowTitle().startswith(label + " : ")]
+            window = matching[0] if len(matching) == 1 else None
+        if window is not None and window in mdi.subWindowList():
+            mdi.setActiveSubWindow(window)
+    FreeCAD.setActiveDocument(document.Name)
+
+
 class _DocumentObserver:
     """Publish FreeCAD document lifecycle without periodic process polling."""
 
@@ -49,7 +73,7 @@ class _DocumentObserver:
         current = {}
         documents = FreeCAD.listDocuments()
         for document in documents.values():
-            name = getattr(document, "Name", None)
+            name = self._document_name(document)
             path = self._document_path(document)
             if name and path:
                 current[name] = path
@@ -64,9 +88,22 @@ class _DocumentObserver:
             self.events.put((path, os.getpid()))
         return sorted(current_paths)
 
+    @staticmethod
+    def _document_name(document):
+        try:
+            return getattr(document, "Name", None)
+        except ReferenceError:
+            # FreeCAD document observers may retain a Python proxy briefly
+            # after its underlying C++ document has already been deleted.
+            return None
+
     def _document_path(self, document):
-        name = getattr(document, "Name", None)
-        path = getattr(document, "FileName", "") or self.source_paths.get(name, "")
+        try:
+            name = getattr(document, "Name", None)
+            path = (getattr(document, "FileName", "")
+                    or self.source_paths.get(name, ""))
+        except ReferenceError:
+            return ""
         return os.path.normcase(os.path.realpath(os.path.abspath(path))) if path else ""
 
     def _on_gui_thread(self, callback, timeout=2):
@@ -110,29 +147,76 @@ class _DocumentObserver:
                              if self._document_path(document) == filepath), None)
             if document is None:
                 return False
-            import FreeCADGui
-            from PySide import QtWidgets
-            mdi = FreeCADGui.getMainWindow().findChild(QtWidgets.QMdiArea)
-            if mdi is not None:
-                view = FreeCADGui.getDocument(document.Name).activeView()
-                graphics = view.graphicsView() if view is not None and hasattr(
-                    view, "graphicsView") else None
-                window = graphics
-                while window is not None and not isinstance(window, QtWidgets.QMdiSubWindow):
-                    window = window.parentWidget()
-                if window is None:
-                    # Some document types have no graphicsView; their tab
-                    # title is usable only when its label is unambiguous.
-                    label = str(getattr(document, "Label", ""))
-                    matching = [candidate for candidate in mdi.subWindowList()
-                                if candidate.windowTitle().startswith(label + " : ")]
-                    window = matching[0] if len(matching) == 1 else None
-                if window is not None and window in mdi.subWindowList():
-                    mdi.setActiveSubWindow(window)
-            FreeCAD.setActiveDocument(document.Name)
+            activate_gui_document(document)
             return True
 
         return self._on_gui_thread(activate)
+
+    def open_pcb(self, filepath, socket_path, *, create=False, active_only=False,
+                 probe=False, document_name=None):
+        """Reload linked boards from the invoking editor, then select their tab."""
+        filepath = os.path.normcase(os.path.realpath(os.path.abspath(filepath)))
+
+        def open_on_gui():
+            from .PcbObject import create_pcb_object, _resolved_linked_filename
+            document = None
+            matches = []
+            active = getattr(FreeCAD, "ActiveDocument", None)
+            candidates = [active] if active is not None else []
+            if not active_only:
+                candidates.extend(doc for doc in FreeCAD.listDocuments().values()
+                                  if doc is not active)
+            if document_name is not None:
+                candidates = [doc for doc in FreeCAD.listDocuments().values()
+                              if doc.Name == document_name]
+            for candidate in candidates:
+                matches = [obj for obj in candidate.Objects
+                           if getattr(getattr(obj, "Proxy", None), "Type", None)
+                           in ("PcbObject", "LinkedObject")
+                           and _resolved_linked_filename(obj)
+                           and os.path.normcase(os.path.realpath(
+                               os.path.abspath(_resolved_linked_filename(obj)))) == filepath]
+                if matches:
+                    document = candidate
+                    break
+            if probe:
+                return document.Name if document is not None else None
+            if document_name is not None and document is None:
+                raise RuntimeError("The selected FreeCAD document was closed or its PCB link changed")
+            created = document is None
+            if created and (not create or active_only):
+                return False
+            import FreeCADGui
+            window = FreeCADGui.getMainWindow()
+            if window.isMinimized():
+                window.showNormal()
+            window.raise_()
+            window.activateWindow()
+            if created:
+                stem = os.path.splitext(os.path.basename(filepath))[0] or "PCB"
+                document = FreeCAD.newDocument(stem)
+            try:
+                if created:
+                    matches = [create_pcb_object(filepath, document=document, recompute=False)]
+                for obj in matches:
+                    obj.Proxy.reload_sync(obj, socket_path=socket_path,
+                                          only_if_changed=True)
+                # reload_sync already builds and assigns the final shapes.
+                # A document-wide recompute repeats expensive display meshing.
+                activate_gui_document(document)
+                if created:
+                    FreeCADGui.getDocument(document.Name).activeView().fitAll()
+            except Exception:
+                if created:
+                    FreeCAD.closeDocument(document.Name)
+                raise
+            return True
+
+        try:
+            return self._on_gui_thread(open_on_gui, timeout=300)
+        except Exception as exc:
+            _log(f"Open in FreeCAD failed: {exc}", error=True)
+            raise
 
     def open_document(self, filepath):
         """Open a new file in this GUI process and identify its document."""
@@ -151,6 +235,9 @@ class _DocumentObserver:
                 # current importer settings without blocking the GUI thread.
                 import Import
                 Import.open(filepath)
+            elif suffix == ".stl":
+                import Mesh
+                Mesh.open(filepath)
             elif suffix == ".kkkk_asm":
                 from . import Assembly
                 Assembly.open(filepath)
@@ -181,7 +268,8 @@ class _DocumentObserver:
                        document.Name not in self.source_paths]
             if len(unbound) != 1:
                 return False
-            if (os.path.splitext(filepath)[1].lower() in (".step", ".stp") and
+            if (os.path.splitext(filepath)[1].lower()
+                    in (".step", ".stp", ".stl") and
                     not getattr(unbound[0], "Objects", ())):
                 return False
             self.register_source(unbound[0], filepath)
@@ -201,7 +289,7 @@ class _DocumentObserver:
                     pass
 
     def _record(self, document):
-        name = getattr(document, "Name", None)
+        name = self._document_name(document)
         path = self._document_path(document)
         if not name or not path:
             return
@@ -231,7 +319,10 @@ class _DocumentObserver:
         self._record(document)
 
     def slotDeletedDocument(self, document):
-        name = getattr(document, "Name", None)
+        name = self._document_name(document)
+        if not name:
+            self._scan_paths()
+            return
         self.source_paths.pop(name, None)
         path = self.paths.pop(name, None)
         if path and path not in self.paths.values():
@@ -257,6 +348,7 @@ def ensure_node(observe_documents=None):
             node.set_document_provider(_document_observer.list_documents)
             node.set_document_activator(_document_observer.activate_document)
             node.set_document_opener(_document_observer.open_document)
+            node.set_pcb_opener(_document_observer.open_pcb)
             node.set_source_registrar(_document_observer.bind_launched_source)
             _document_observer._scan_paths()
         return node
@@ -297,7 +389,8 @@ def _request(message):
     return im_mesh.request(message)
 
 
-def send_request(action, filepath, object_label="", component=""):
+def send_request(action, filepath, object_label="", component="",
+                 log_errors=True):
     """Run a KiCad request off the GUI thread, then dispatch the reply."""
     message = _message(action, filepath, object_label, component)
 
@@ -309,7 +402,7 @@ def send_request(action, filepath, object_label="", component=""):
         reply.setdefault("action", action)
         reply.setdefault("object", object_label)
         reply.setdefault("component", component)
-        if reply.get("status") == "error":
+        if log_errors and reply.get("status") == "error":
             _log(reply.get("message", "unknown instance error"), error=True)
         if _response_handler is not None:
             dispatch_to_main_thread(lambda: _response_handler(reply))

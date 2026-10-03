@@ -12,6 +12,11 @@ instance when opening a file; see [Instance Manager](https://github.com/buganini
 for details.
 
 > [!NOTE]
+> FreeCAD installed through Snap is not supported. Snap confinement isolates
+> the filesystem and local sockets, preventing FreekiCAD from connecting to
+> KiCad's IPC endpoint. Selecting the Snap executable manually does not remove
+> this isolation; use a non-Snap FreeCAD installation or the official AppImage.
+>
 > Affected Windows builds expose only one IPC endpoint for multiple instances
 > due to [KiCad issue #23994](https://gitlab.com/kicad/code/kicad/-/work_items/23994).
 > Close all running KiCad applications before first using Kikakuka or
@@ -29,7 +34,7 @@ for details.
 
 - Opening, importing, or dragging external `.kicad_pcb` files as linked PCB
   objects with automatic source reload
-- Adding reloadable linked STEP objects
+- Adding reloadable linked STEP and native STL mesh objects
 - Editing board outlines and synchronizing component placement changes back to
   KiCad
 - Optionally importing copper, solder mask, and silkscreen display layers
@@ -38,12 +43,12 @@ for details.
 - Bending flexible PCBs from a KiCad user layer named `FreekiCAD`
 - Automatically aligning linked PCBs with matching `CouplerFixed` and
   `CouplerMoving` footprints or an absolute `CouplerAt`
-- Assembling linked PCBs and STEP models with FreeCAD Assembly, Manipulator,
-  or direct transforms
+- Assembling linked PCBs, STEP models, and STL meshes with FreeCAD Assembly,
+  Manipulator, or direct transforms
 - Importing and exporting portable `.kkkk_asm` assembly manifests, including
   flattened FreeCAD Assembly and `App::Link` placements
 - Exporting `.kkkk_asm` assemblies or individual `.kicad_pcb` boards to STEP
-  with `freecadcmd`
+  or STL with `freecadcmd`
 - Running independently of the Kikakuka main program through the local
   per-process Instance Manager mesh
 
@@ -68,44 +73,47 @@ the foreground before waiting for its IPC endpoint. User-initiated file opens
 always activate KiCad; the complete policy is documented in
 [Instance Manager](https://github.com/buganini/Kikakuka/blob/main/im/README.md#kicad-foreground-policy).
 
-Both `.kicad_pcb` boards and STEP models remain linked to their external source
-files. When an assembly is saved as an `.FCStd` document, that document caches
+`.kicad_pcb` boards, STEP models, and STL meshes remain linked to their external
+source files. When an assembly is saved as an `.FCStd` document, that document caches
 the generated objects and geometry while retaining each source path so the
-linked object can be reloaded. `AutoReload` is enabled by default for both
-object types and can be disabled independently on each linked object.
+linked object can be reloaded. `AutoReload` is enabled by default and can be
+disabled independently on each linked object.
 
 By contrast, a `.kkkk_asm` manifest never contains cached objects or generated
 geometry. It stores only the linked source paths, object settings, and
 placements, and prefers paths relative to the manifest, falling back to an
 absolute path only when a relative path cannot be represented. On import,
 relative paths are resolved from the manifest's directory and every source is
-loaded fresh. This also makes FreekiCAD useful for assembling multiple STEP
-models without KiCad.
+loaded fresh. This also makes FreekiCAD useful for assembling external models
+without KiCad. STL files have no unit metadata, so linked `StlObject` instances
+interpret one coordinate unit as one millimetre by default and expose
+`LengthPerUnit` for other source units. `LengthPerUnit` is a FreeCAD length
+field, so values such as `1 mm`, `1 in`, or `1 mil` may be entered directly.
+Portable manifests store its canonical millimetre value as `LengthPerUnitMM`.
 
 The [FPC assembly example][fpc-assembly-example] shows a `.kkkk_asm` manifest
 containing linked KiCad PCB files.
 
 FreeCAD's Open and Import commands and drag-and-drop all create the same linked
-`PcbObject` as **FreekiCAD > Add KiCad PCB**. STEP extensions remain assigned to
-FreeCAD's built-in STEP importer; use **FreekiCAD > Add STEP** when a reloadable
-linked STEP object is wanted.
+`PcbObject` as **FreekiCAD > Add KiCad PCB**. STEP and STL extensions remain
+assigned to FreeCAD's built-in importers; use **FreekiCAD > Add STEP** or
+**FreekiCAD > Add STL** when a reloadable linked object is wanted. STL models
+referenced by KiCad footprints are converted to faceted Part geometry so they
+can use the existing component placement and export pipeline.
 
 ## Manual Installation
 
 You can install FreekiCAD from Kikakuka's **Add-ons** tab, which installs
-FreekiCAD and its required Python dependencies together. Kikakuka release
-builds already contain the addon package. When running Kikakuka from source,
-generate the packages with
+FreekiCAD and its required `psutil`, `kicad-python`, and `shapely` packages
+together. Kikakuka release builds already contain the addon package. When
+running Kikakuka from source, generate the packages with
 `python3 build_addon_archives.py` (or `make archive-zips`) before using its
 Add-ons tab.
 
-FreekiCAD requires FreeCAD 1.0 or later and `psutil>=7.2.2`
-for instance discovery and FreeCAD document-state publication. KiCad PCB
-integration additionally requires KiCad 9.0 or later plus
-`kicad-python>=0.8,<0.9` and `shapely>=2.0.7`; these two packages are optional
-for STEP-only workflows. FreeCAD Addon Manager may not automatically install
-`psutil` where its allowed-package list excludes it; install
-it manually inside FreeCAD if necessary.
+FreekiCAD requires FreeCAD 1.0 or later, KiCad 9.0 or later, `psutil>=7.2.2`,
+`kicad-python>=0.8,<0.9`, and `shapely>=2.0.7`. FreeCAD Addon Manager may not
+automatically install packages where its allowed-package list excludes them;
+install them manually inside FreeCAD if necessary.
 
 For a fully manual installation:
 
@@ -114,28 +122,32 @@ For a fully manual installation:
    installation directory.
 3. Create the `Mod` directory if it does not exist, then copy the `FreekiCAD`
    folder into it.
-4. Install `psutil` inside FreeCAD. For full KiCad integration, this single
-   line also installs the KiCad extras. It waits for pip to finish, then prints
-   its output:
+4. Install the required Python packages inside FreeCAD. This waits for pip to
+   finish, then prints its output:
 
    ```python
    import subprocess,os,sys; print(subprocess.run([os.path.join(os.path.dirname(sys.executable),"python"),"-m","pip","install","kicad-python>=0.8,<0.9","shapely>=2.0.7","psutil>=7.2.2"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout)
    ```
 
-## Headless STEP Export
+## Headless STEP and STL Export
 
 Use `kkkk_export.py` with FreeCAD's command-line executable to convert a
-`.kkkk_asm` assembly or a single `.kicad_pcb` board to STEP without opening
-the FreeCAD GUI:
+`.kkkk_asm` assembly or a single `.kicad_pcb` board to STEP or STL without
+opening the FreeCAD GUI:
 
 ```text
 freecadcmd scripts/kkkk_export.py input.kkkk_asm output.step
 freecadcmd scripts/kkkk_export.py input.kicad_pcb output.step
+freecadcmd scripts/kkkk_export.py input.kkkk_asm output.stl
 ```
 
 The exporter synchronously loads every object and component model before it
-writes the STEP file. Assemblies containing only STEP objects need no
-KiCad-specific Python dependencies beyond FreekiCAD's core packages. For
+writes the output file. STEP output converts linked STL meshes to faceted
+B-Rep solids and rejects meshes that are not closed and manifold; it cannot
+recover analytic CAD surfaces from STL triangles. STL output keeps linked STL
+objects as meshes and tessellates PCB/STEP Part geometry. Standard STL does not
+preserve colors or materials. Assemblies containing only STEP/STL objects need
+no KiCad-specific Python dependencies beyond FreekiCAD's core packages. For
 assemblies containing KiCad PCB objects, install the KiCad extras above;
 FreekiCAD resolves or starts the matching KiCad
 instance itself and waits for its IPC API.
@@ -177,10 +189,11 @@ In the platform-specific commands above, `input.kkkk_asm` may be replaced by
 
 ## FreeCAD Assembly Workbench
 
-FreekiCAD `PcbObject` and `StepObject` objects can be inserted as components in
-FreeCAD's built-in Assembly workbench. Assembly creates an `App::Link` for each
-instance, so one linked source may be used multiple times with independent
-placements while source-file reloads continue to update its geometry.
+FreekiCAD `PcbObject`, `StepObject`, and `StlObject` objects can be inserted as
+components in FreeCAD's built-in Assembly workbench. Assembly creates an
+`App::Link` for each instance, so one linked source may be used multiple times
+with independent placements while source-file reloads continue to update its
+geometry.
 
 FreeCAD Assembly currently cannot resolve faces belonging to child objects
 inside a linked `PcbObject`. The GUI can select a board, component, or connector
@@ -190,14 +203,16 @@ including connector faces on bent sections, may not align correctly. This
 limitation does not affect direct `App::Link` placement, Manipulator alignment,
 coupler-based alignment, or flattened `.kkkk_asm` export. `StepObject` geometry
 is stored directly on the linked object and is not subject to this limitation.
+`StlObject` supports direct placement but mesh facets do not provide the same
+stable analytic faces as STEP for precision Assembly joints.
 Use the Manipulator workbench when a PCB child or bent-section face cannot be
 aligned with an Assembly joint.
 
 When exporting `.kkkk_asm`, the selection determines which placement is
 exported:
 
-- Selecting an original `PcbObject` or `StepObject` exports that source
-  object's own Placement.
+- Selecting an original `PcbObject`, `StepObject`, or `StlObject` exports that
+  source object's own Placement.
 - Selecting an `App::Link` exports its linked source at the instance's final
   global placement.
 - Selecting an `Assembly::AssemblyObject` recursively expands its direct and
@@ -254,7 +269,7 @@ custom footprint properties:
   back side.
 - `Offset` moves the plane origin on the PCB surface in the direction shown by
   the footprint triangle. Both `Z` and `Offset` default to `0 mm`; unitless
-  values are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um`/`µm`
+  values are millimetres, and `mm`, `cm`, `in`, `mil` (`0.001 in`), and `um`/`µm`
   are supported.
 - `Tilt` rotates the plane around its local X axis, in degrees, and defaults
   to `0`. Placement applies the footprint pose, `Offset`, `Z`, then `Tilt`;
@@ -263,7 +278,7 @@ custom footprint properties:
 
 `CouplerAt` also has `TargetX`, `TargetY`, and `TargetZ` properties for its
 absolute FreeCAD world target. All three default to `0 mm`; unitless values
-are millimetres, and `mm`, `in`, `mil` (`0.001 in`), and `um`/`µm` are
+are millimetres, and `mm`, `cm`, `in`, `mil` (`0.001 in`), and `um`/`µm` are
 supported.
 It has no local `Z` property. B.Cu is recommended for the usual bottom-surface
 placement at `TargetZ`; use F.Cu only to reference the top surface.
@@ -306,7 +321,7 @@ Thickness=25 um
 optional and property names are case-insensitive. A non-empty `Name` becomes
 the suffix of the FreeCAD child name and label (`F_Stiffener_<Name>` or
 `B_Stiffener_<Name>`) and is included in warning messages. Thickness accepts
-`mm`, `in`, `mil` (`0.001 in`), and `um`; a unitless value is interpreted as
+`mm`, `cm`, `in`, `mil` (`0.001 in`), and `um`; a unitless value is interpreted as
 millimetres.
 
 | Material | Default color | Default opacity |
@@ -358,9 +373,25 @@ a=-70 s=0.61
 ```
 
 - `a` is the bend angle in degrees.
-- `r` is the bend radius in millimetres.
-- `s` is the full bend span in millimetres; when `r` is omitted, FreekiCAD
+- `r` is the bend radius.
+- `s` is the full bend span; when `r` is omitted, FreekiCAD
   derives the radius from `s`, the angle, and the KiCad stackup thickness.
+
+Both `r` and `s` accept `mm`, `cm`, `um` (also `µm`/`μm`), `in`, and `mil`.
+Unitless lengths are millimetres; suffixes are case-insensitive and may be
+separated from the number by whitespace. For example, `r=0.05cm`, `r=500um`,
+and `r=0.5mm` are equivalent. If both `r` and `s` are present, `r` takes
+precedence. Unsupported units are rejected rather than treated as millimetres.
+
+Parameters may appear in any order, with whitespace on either side of `=`
+and between the number and its unit. These examples all specify a 5 mm radius
+and a 60-degree bend:
+
+```text
+a=60 r=5mm
+r= 5 mm a=60
+r  =  5 mm   a  =  60
+```
 
 Each imported bend line becomes a FreeCAD child object with editable `Angle`,
 `Radius`, and `Active` properties. A line without parameter text still loads
