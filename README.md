@@ -231,11 +231,11 @@ source object in the current FreeCAD document.
 
 The following video demonstrates coupler-based alignment:
 
-https://github.com/user-attachments/assets/c20a8d80-be67-4816-9a69-82f348ab255e
+### Tutorial Video
+
+[![Kikakuka/FreekiCAD – STL/STEP and KiCad PCB Assembly](https://img.youtube.com/vi/geRS6CZaJ4s/0.jpg)](https://www.youtube.com/watch?v=geRS6CZaJ4s)
 
 ![Coupler-Arguments](https://github.com/buganini/Kikakuka/raw/main/screenshots/coupler-args.png)
-
-See the [coupler-alignment screenshots][coupler-screenshots] for the key steps.
 
 Use the bundled `CouplerFixed` and `CouplerMoving` KiCad footprints to align
 two linked PCBs. Place `CouplerFixed` on the reference board and
@@ -354,8 +354,13 @@ an area are also errors; unannotated areas are skipped with a warning. The
 [FPC sample board][fpc-sample] contains a complete stiffener example.
 
 ## Flexible PCB Bending
+### Tutorial Video
 
+[![Kikakuka/FreekiCAD – Flexible PCB Bending](https://img.youtube.com/vi/iNXvksXA2hA/0.jpg)](https://www.youtube.com/watch?v=iNXvksXA2hA)
+
+<!--
 ![Flexible PCB bending](https://github.com/buganini/Kikakuka/raw/main/screenshots/freekicad_fpc.png)
+-->
 
 Rename an unused KiCad user layer to `FreekiCAD` (case-insensitive). This is
 the layer name used for flexible-PCB bending. Draw each bend as a line segment
