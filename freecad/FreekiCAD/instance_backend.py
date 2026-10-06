@@ -451,19 +451,31 @@ def _sockets():
     return list(explicit.items())
 
 
-def _ready_board(socket_path, max_retries=0, delay_s=1.0):
+def _board_from_socket(socket_path, max_retries=0, delay_s=1.0,
+                       probe_ready=True):
     from kipy.kicad import KiCad
-    from .kicad_api_retry import get_ready_kicad_board
+    from .kicad_api_retry import get_ready_kicad_board, retry_kicad_call
 
     # The caller may have inherited another KiCad instance's API token.
     # An empty initial token lets kipy learn the selected endpoint's token.
     kicad = KiCad(socket_path=f"ipc://{socket_path}", kicad_token="", timeout_ms=1000)
-    board = get_ready_kicad_board(
-        kicad,
-        max_retries=max_retries,
-        delay_s=delay_s,
-        retry_connection_timeout=True,
-    )
+    if probe_ready:
+        board = get_ready_kicad_board(
+            kicad,
+            max_retries=max_retries,
+            delay_s=delay_s,
+            retry_connection_timeout=True,
+        )
+    else:
+        # Discovering an already-open export only needs its document path.
+        # Avoid transferring every board shape before revert; the post-revert
+        # readiness probe remains the authoritative full-board check.
+        board = retry_kicad_call(
+            kicad.get_board,
+            max_retries=max_retries,
+            delay_s=delay_s,
+            retry_connection_timeout=True,
+        )
     compatibility = get_kicad_compat(kicad.get_version())
     try:
         _BOARD_COMPATIBILITY[board] = compatibility
@@ -474,6 +486,18 @@ def _ready_board(socket_path, max_retries=0, delay_s=1.0):
         except (AttributeError, TypeError):
             pass
     return board
+
+
+def _ready_board(socket_path, max_retries=0, delay_s=1.0):
+    return _board_from_socket(
+        socket_path, max_retries=max_retries, delay_s=delay_s,
+        probe_ready=True)
+
+
+def _connected_board(socket_path, max_retries=0, delay_s=1.0):
+    return _board_from_socket(
+        socket_path, max_retries=max_retries, delay_s=delay_s,
+        probe_ready=False)
 
 
 def _board_path_from_ready_board(board):
@@ -491,10 +515,11 @@ def _board_path(socket_path):
     return _board_path_from_ready_board(_ready_board(socket_path))
 
 
-def _find_board(filepath, wait_until_ready=False):
+def _find_board(filepath, wait_until_ready=False, lightweight=False):
+    board_loader = _connected_board if lightweight else _ready_board
     for pid, socket_path in _sockets():
         try:
-            board = _ready_board(
+            board = board_loader(
                 socket_path,
                 max_retries=(FRESH_READY_RETRIES if wait_until_ready else 0),
                 delay_s=(FRESH_READY_DELAY_S if wait_until_ready else 1.0),
@@ -835,14 +860,16 @@ def _revert_ready_board(board):
     )
 
 
-def _open_new(filepath, program, is_board, node, ensure_fresh=False):
+def _open_new(filepath, program, is_board, node, ensure_fresh=False,
+              restore_focus_pid=None):
     """Serialize launches for different files as well as for the same file."""
     with launch_lock(program):
         # The previous launch may have completed while this request waited
         # for the global slot. Recheck before creating another editor.
         if is_board:
             pid, socket_path, board = _find_board(
-                filepath, wait_until_ready=ensure_fresh)
+                filepath, wait_until_ready=ensure_fresh,
+                lightweight=ensure_fresh)
             if pid is not None:
                 if ensure_fresh:
                     _revert_ready_board(board)
@@ -874,8 +901,21 @@ def _open_new(filepath, program, is_board, node, ensure_fresh=False):
             # The modal prompt blocks IPC startup. Bring it forward before
             # waiting for the board to become discoverable.
             _focus(pid)
+        elif pid is not None and restore_focus_pid is not None:
+            # LaunchServices' ``open -g`` is only a request.  PCB Editor can
+            # still activate itself while constructing its wx window, so put
+            # the requesting FreeCAD process back in front immediately.
+            _focus(restore_focus_pid)
         if is_board:
-            return _wait_for_board(filepath)
+            result = _wait_for_board(filepath)
+            if (restore_focus_pid is not None
+                    and (result[0] is not None
+                         or not may_prompt_open_anyway)):
+                # PCB Editor may activate after the process first appears.
+                # Restore again once startup/IPC has settled.  If a lock
+                # prompt never resolves, leave it visible instead.
+                _focus(restore_focus_pid)
+            return result
         if program == "freecad" and pid is not None:
             if not bind_freecad_source(pid, filepath):
                 raise RuntimeError(
@@ -899,6 +939,12 @@ def handle(request):
     if action not in {"open-file", "reload", "open-sketch", "move-component",
                       "update-coupler", "monitor-couplers"}:
         return {"status": "error", "message": f"unknown action: {action}"}
+    caller_pid = request.get("caller_pid")
+    if (caller_pid is not None
+            and (not isinstance(caller_pid, int)
+                 or isinstance(caller_pid, bool)
+                 or caller_pid <= 0)):
+        return {"status": "error", "message": "invalid caller PID"}
     is_freecad = filepath.lower().endswith(FREECAD_SUFFIXES)
     if not filepath.lower().endswith((".kicad_pcb", ".kicad_sch", ".kicad_pro", *FREECAD_SUFFIXES)) or not os.path.isfile(filepath):
         return {"status": "error", "message": f"editor file not found: {filepath}"}
@@ -913,7 +959,9 @@ def handle(request):
                 "message": "ensure_fresh requires an open-file PCB request"}
     ensure_fresh = bool(request.get("ensure_fresh"))
     pid, socket_path, board = (
-        _find_board(filepath, wait_until_ready=ensure_fresh)
+        _find_board(
+            filepath, wait_until_ready=ensure_fresh,
+            lightweight=ensure_fresh)
         if is_board else (None, None, None)
     )
     if is_board and mapped and pid != mapped and node:
@@ -926,9 +974,15 @@ def handle(request):
     if pid is None and action == "monitor-couplers":
         return {"status": "error", "message": "file is not open in KiCad"}
     if pid is None:
+        restore_focus_pid = (
+            caller_pid
+            if action != "open-file" and platform.system() == "Darwin"
+            else None
+        )
         pid, socket_path = _open_new(
             filepath, "freecad" if is_freecad else "kicad", is_board, node,
-            ensure_fresh=ensure_fresh)
+            ensure_fresh=ensure_fresh,
+            restore_focus_pid=restore_focus_pid)
         if pid is None:
             message = ("KiCad IPC did not report the requested board within 30 seconds"
                        if is_board else "could not determine editor PID")
